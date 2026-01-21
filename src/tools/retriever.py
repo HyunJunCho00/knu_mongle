@@ -6,14 +6,13 @@ from typing import List, Optional, Tuple
 from collections import Counter
 from qdrant_client import QdrantClient, models
 from kiwipiepy import Kiwi
-from src.core.config import settings  
+from src.core.config import settings
 
 class KNUSearcher:
     """
     Hybrid Searcher: Cloudflare Workers AI (Dense) + Kiwi (Sparse)
     """
     def __init__(self):
-        # 1. Qdrant Client 초기화
         self.client = QdrantClient(
             url=settings.QDRANT_URL,
             api_key=settings.QDRANT_API_KEY,
@@ -22,23 +21,21 @@ class KNUSearcher:
             timeout=60,
             verify=False
         )
-        self.collection_name = settings.QDRANT_COLLECTION_NAME
+        self.collection_name = settings.COLLECTION_NAME
 
-        # 2. Sparse Encoder Setup (Kiwi) - embedding.txt와 동일한 로직 유지를 위해 로컬 실행
         print("[System] Initializing Kiwi for Sparse Encoding...")
-        self.kiwi = Kiwi()
+        self.kiwi = Kiwi(num_workers=0, model_type='sbg')
         
-        # [cite_start]embedding.txt의 불용어 태그 리스트와 동일하게 맞춤 [cite: 8]
         self.stop_tags = {
             'JKS', 'JKC', 'JKG', 'JKO', 'JKB', 'JKV', 'JKQ', 'JX', 'JC',
-            'EP', 'EF', 'EC', 'ETN', 'ETM', 'SP', 'SS', 'SE', 'SO', 'SL', 
-            'SH', 'SN', 'SF', 'SY', 'IC', 'XPN', 'XSN', 'XSV', 'XSA', 
+            'EP', 'EF', 'EC', 'ETN', 'ETM', 'SP', 'SS', 'SE', 'SO', 'SL',
+            'SH', 'SN', 'SF', 'SY', 'IC', 'XPN', 'XSN', 'XSV', 'XSA',
             'XR', 'MM', 'MAG', 'MAJ', 'VCP', 'VCN', 'VA', 'VV', 'VX'
         }
 
     def _encode_dense(self, text: str) -> List[float]:
         """
-        Cloudflare Workers AI (BGE-M3) API 호출
+        Cloudflare Workers AI (BGE-M3) API call
         """
         account_id = settings.CLOUDFLARE_ACCOUNT_ID
         api_token = settings.CLOUDFLARE_API_TOKEN
@@ -47,16 +44,28 @@ class KNUSearcher:
         headers = {"Authorization": f"Bearer {api_token}"}
         
         try:
-            response = requests.post(url, headers=headers, json={"text": text}, timeout=5)
+            response = requests.post(
+                url,
+                headers=headers,
+                json={"text": [text]},
+                timeout=10
+            )
+            response.raise_for_status()
             result = response.json()
             
-            # Cloudflare 응답 파싱 (성공 여부 확인)
             if result.get("success"):
-                # 보통 result['result']['data'][0]에 벡터가 있음
-                return result['result']['data'][0]
+                embeddings = result['result']['data']
+                if isinstance(embeddings, list) and len(embeddings) > 0:
+                    if isinstance(embeddings[0], list):
+                        return embeddings[0]
+                    else:
+                        return embeddings
+                else:
+                    print(f"[Error] Unexpected embedding format: {result}")
+                    return [0.0] * 1024
             else:
                 print(f"[Error] Cloudflare API Error: {result}")
-                return [0.0] * 1024  # 에러 시 0 벡터 반환 (검색 실패 방지)
+                return [0.0] * 1024
                 
         except Exception as e:
             print(f"[Error] Dense encoding failed: {e}")
@@ -64,16 +73,16 @@ class KNUSearcher:
 
     def _encode_sparse(self, text: str) -> Tuple[Optional[List[int]], Optional[List[float]]]:
         """
-        [cite_start]Kiwi 형태소 분석 + MMH3 해싱 (embedding.txt 로직과 100% 일치시켜야 함) [cite: 30-45]
+        Kiwi morphological analysis + MMH3 hashing
         """
         try:
             tokens = self.kiwi.tokenize(text)
             keywords = [
-                t.form for t in tokens 
+                t.form for t in tokens
                 if t.tag not in self.stop_tags and len(t.form) > 1
             ]
             
-            if not keywords: 
+            if not keywords:
                 return None, None
             
             term_counts = Counter(keywords)
@@ -81,10 +90,8 @@ class KNUSearcher:
             values = []
             
             for term, count in term_counts.items():
-                # [cite_start]Qdrant Sparse Index용 해싱 [cite: 44]
                 idx = mmh3.hash(term, signed=False)
-                # Query-side weighting: SQRT(TF) 적용
-                val = float(np.sqrt(count)) 
+                val = float(np.sqrt(count))
                 
                 indices.append(idx)
                 values.append(val)
@@ -96,34 +103,38 @@ class KNUSearcher:
 
     def search(self, query: str, target_dept: str = None, final_k: int = 5):
         """
-        Hybrid Search 수행 및 결과 파싱
+        Hybrid Search with RRF fusion
         """
         start_time = time.perf_counter()
         
-        # 1. 벡터 변환 (API + Local CPU)
         dense_vec = self._encode_dense(query)
         sp_indices, sp_values = self._encode_sparse(query)
         
-        # 2. 필터 구성
         search_filter = None
         if target_dept and target_dept != "공통":
             search_filter = models.Filter(
-                must=[models.FieldCondition(key="dept", match=models.MatchValue(value=target_dept))]
+                must=[models.FieldCondition(
+                    key="dept",
+                    match=models.MatchValue(value=target_dept)
+                )]
             )
 
-        # 3. Prefetch 구성 (Dense + Sparse)
         prefetch = []
         prefetch.append(models.Prefetch(
-            query=dense_vec, using="dense", limit=50, filter=search_filter
+            query=dense_vec,
+            using="dense",
+            limit=50,
+            filter=search_filter
         ))
         
         if sp_indices:
             prefetch.append(models.Prefetch(
                 query=models.SparseVector(indices=sp_indices, values=sp_values),
-                using="sparse", limit=50, filter=search_filter
+                using="sparse",
+                limit=50,
+                filter=search_filter
             ))
 
-        # 4. 검색 실행 (RRF)
         try:
             results = self.client.query_points(
                 collection_name=self.collection_name,
@@ -137,18 +148,20 @@ class KNUSearcher:
             print(f"[Error] Search failed: {e}")
             return []
 
-        # 5. 결과 가공
         parsed_results = []
         if results and results.points:
             for point in results.points:
                 payload = point.payload or {}
                 parsed_results.append({
                     "score": point.score,
-                    "title": payload.get("title", "제목 없음"),
+                    "title": payload.get("title", "No title"),
                     "content": payload.get("content", ""),
                     "url": payload.get("url", ""),
-                    "dept": payload.get("dept", "공통"),
+                    "dept": payload.get("dept", "Common"),
                     "date": payload.get("date", "")
                 })
+        
+        elapsed = time.perf_counter() - start_time
+        print(f"[Search] Query: '{query}' | Results: {len(parsed_results)} | Time: {elapsed:.3f}s")
         
         return parsed_results
