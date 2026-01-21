@@ -1,47 +1,46 @@
-import base64
 import os
-import uuid
 from urllib.parse import urljoin
-from knu_chatbot.crawling.config import CONFIG # 설정값 불러오기
+from groq import Groq
 
-def save_base64_image(base64_str):
-    """
-    Base64 문자열을 이미지 파일로 저장하고 상대 경로를 반환합니다.
-    """
+try:
+    groq_client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+except:
+    groq_client = None
+
+def analyze_image(image_src):
+    if not groq_client: return ""
+    
+    if image_src.startswith("data:image") and len(image_src) < 1000:
+        return ""
+
     try:
-        if ";base64," not in base64_str:
-            return None
-        
-        header, data = base64_str.split(";base64,")
-        
-        file_ext = "png"
-        if "image/" in header:
-            file_ext = header.split("image/")[1]
-            if file_ext == "jpeg": file_ext = "jpg"
-        
-        filename = f"{uuid.uuid4()}.{file_ext}"
-        save_path = os.path.join(CONFIG["image_dir"], filename)
-        
-        with open(save_path, "wb") as f:
-            f.write(base64.b64decode(data))
-            
-        return f"./data/images/{filename}"
-        
-    except Exception as e:
-        print(f"[Image Error] Base64 decoding failed: {e}")
-        return None
+        completion = groq_client.chat.completions.create(
+            model="meta-llama/llama-4-scout-17b-16e-instruct",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Analyze this image and extract all text and key visual information in Korean. Be concise."},
+                        {"type": "image_url", "image_url": {"url": image_src}}
+                    ]
+                }
+            ],
+            temperature=0.0,
+            max_tokens=800
+        )
+        return completion.choices[0].message.content
+    except Exception:
+        return ""
 
 def parse_post_content(soup, url):
     if not soup: return "", [], []
 
-    # 1. 노이즈 제거
     for tag in soup(["script", "style", "iframe", "header", "footer", 
                      ".gnb", ".snb", ".lnb", "#header", "#footer", "#top", "#bottom", 
                      ".leftmenu", ".pagetitle", ".btn_area", ".prev_next", 
                      ".comment", "#comment", ".totalsearch"]):
         tag.decompose()
 
-    # 2. 본문 영역 찾기
     candidates = [
         "td.contentview", ".board_view", "#bo_v_con", ".board_view_con", 
         "div.cont", ".view_content", "div[id^='bo_v_con']"
@@ -59,7 +58,6 @@ def parse_post_content(soup, url):
             
             content = element.get_text("\n", strip=True)
             
-            # [보강] 표 내용 추가 추출
             if len(content) < 10:
                 tables = element.select("table")
                 for tbl in tables:
@@ -73,37 +71,31 @@ def parse_post_content(soup, url):
             content = article.get_text("\n", strip=True)
             content_area = article
 
-    # 3. 이미지 추출 (Base64 -> 파일 저장 로직 적용)
-    images = []
-    
-    # 본문 + 첨부 영역 통합 검색
     targets = []
     if content_area: targets.append(content_area)
     targets.extend(soup.select("#bo_v_img, .view_image, .attached_image, .file_list"))
 
-    seen_src = set()
+    processed_imgs = set()
+    vlm_results = []
+
     for target in targets:
         for img in target.select("img"):
             src = img.get("src")
             if not src: continue
             
-            final_url = None
-            
-            # [A] Base64 이미지인 경우 -> 파일로 저장
-            if src.startswith("data:image"):
-                saved_path = save_base64_image(src)
-                if saved_path:
-                    final_url = saved_path
-            
-            # [B] 일반 URL 이미지인 경우
-            else:
-                final_url = urljoin(url, src)
+            if not src.startswith("data:"):
+                src = urljoin(url, src)
 
-            if final_url and final_url not in seen_src:
-                images.append(final_url)
-                seen_src.add(final_url)
+            if src in processed_imgs: continue
+            processed_imgs.add(src)
 
-    # 4. 첨부파일 추출
+            description = analyze_image(src)
+            if description:
+                vlm_results.append(f"\n[이미지 설명: {description}]")
+
+    if vlm_results:
+        content += "\n" + "\n".join(vlm_results)
+
     attachments = []
     file_selectors = [".addfile a", ".file a", ".bo_v_file a", "a[href*='download']", "a[href*='down']", ".board_view_file a"]
     
@@ -122,4 +114,4 @@ def parse_post_content(soup, url):
             attachments.append({"name": name, "url": full_url})
             seen_urls.add(full_url)
 
-    return content, images, attachments
+    return content, [], attachments

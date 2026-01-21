@@ -10,8 +10,8 @@ from bs4 import BeautifulSoup
 from concurrent.futures import ThreadPoolExecutor
 
 # 모듈 불러오기
-from app.crawling.crawl_config import CONFIG
-from app.crawling.crawl_parsers import parse_post_content
+from src.crawl.crawl_config import CONFIG
+from src.crawl.crawl_parsers import parse_post_content
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
