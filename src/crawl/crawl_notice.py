@@ -5,21 +5,23 @@ import urllib3
 import os
 import re
 import threading
+from pathlib import Path
 from urllib.parse import urljoin
 from bs4 import BeautifulSoup
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import datetime
 
 # 모듈 불러오기
-from src.crawl.crawl_config import CONFIG
-from src.crawl.crawl_parsers import parse_post_content
+from crawl_config import CONFIG
+from crawl_parsers import parse_post_content
+from crawl_image import sanitize_filename
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # 전역 락
 file_lock = threading.Lock()
-
-def sanitize_filename(name):
-    return re.sub(r'[\\/*?:"<>|]', "_", name)
+vlm_lock = threading.Lock()
 
 class BaseCrawler:
     def __init__(self, target):
@@ -34,7 +36,7 @@ class BaseCrawler:
         
         self.session = requests.Session()
         self.session.headers.update(CONFIG["headers"])
-
+        
         self.collected_links = set()
         if os.path.exists(self.file_path):
             with file_lock:
@@ -48,7 +50,7 @@ class BaseCrawler:
                             except: continue
                 except Exception as e:
                     pass
-
+    
     def fetch_page(self, url, referer=None):
         if referer: self.session.headers.update({"Referer": referer})
         try:
@@ -59,7 +61,7 @@ class BaseCrawler:
         except Exception as e:
             print(f"[Error] {self.dept} Fetch Fail: {e}")
             return None
-
+    
     def save_post(self, post_data):
         if post_data['url'] in self.collected_links: return
         
@@ -70,12 +72,86 @@ class BaseCrawler:
                 self.collected_links.add(post_data['url'])
             except Exception as e:
                 print(f"[Save Error] {self.dept}: {e}")
+    
+    def process_detail_page(self, title, date, link, referer=None, force_save=False):
+        # 이미 수집한 링크는 건너뜀 (중복 방지는 유지)
+        if link in self.collected_links: return True
+        
+        soup = self.fetch_page(link, referer)
+        if not soup: return True
 
-    def process_detail_page(self, title, date, link, referer=None):
-        if link in self.collected_links: return
+        # 본문에서 진짜 날짜 확인
+        page_text = soup.get_text()
+        date_match = re.search(r"20\d{2}[-/.](0[1-9]|1[0-2])[-/.](0[1-9]|[12]\d|3[01])", page_text)
         
-        content, images, atts = parse_post_content(self.fetch_page(link, referer), link)
+        if date_match:
+            real_date = date_match.group(0).replace('.', '-').replace('/', '-')
+            if real_date[:4] != date[:4]:
+                date = real_date
+
+        # [수정] 강제 저장 모드(force_save)가 아닐 때만 날짜를 체크하여 스킵
+        if not force_save:
+            if date < self.last_crawled_date:
+                print(f"   ㄴ [Stop] 기준 날짜({self.last_crawled_date}) 미달: {date}")
+                return False
+        else:
+            # 강제 저장 모드일 경우 로그만 찍고 통과
+            if date < self.last_crawled_date:
+                print(f"   ㄴ [Force] 날짜 미달({date})이지만 2페이지 이내라 강제 수집")
+
+        content, images_to_save, atts_to_save = parse_post_content(soup, link)
         
+        safe_dept = sanitize_filename(self.dept)
+        base_dir = Path(CONFIG["attachments_dir"]) / safe_dept / date
+        
+        processed_images = []
+        img_dir = base_dir / "images"
+        
+        for img_info in images_to_save:
+            url = img_info['url']
+            name = sanitize_filename(os.path.basename(url.split('?')[0]) or "image.jpg")
+            save_path = img_dir / name
+            
+            meta = _download_file(self.session, url, save_path, referer=link)
+            
+            processed_images.append({
+                "url": url,
+                "saved_path": str(save_path),
+                "alt": img_info['alt'],
+                "description": img_info['description'], 
+                **meta
+            })
+
+        processed_atts = []
+        extracted_texts = [] 
+        att_dir = base_dir / "files"
+        
+        for att in atts_to_save:
+            url = att['url']
+            name = sanitize_filename(att['name'])
+            ext = os.path.splitext(name)[1]
+            save_path = att_dir / name
+            
+            meta = _download_file(self.session, url, save_path, referer=link)
+            
+            att_data = {
+                "name": name,
+                "url": url,
+                "saved_path": str(save_path),
+                **meta
+            }
+            
+            if meta.get("status") == "success" and ext in CONFIG["extract_text_exts"]:
+                extracted = _extract_text_from_file(save_path, ext)
+                if extracted:
+                    att_data["extracted_text"] = extracted
+                    extracted_texts.append(f"\n\n[첨부파일 내용: {name}]\n{extracted}")
+            
+            processed_atts.append(att_data)
+        
+        if extracted_texts:
+            content += "".join(extracted_texts)   
+            
         self.save_post({
             "dept": self.dept,
             "detail": self.detail,
@@ -83,23 +159,21 @@ class BaseCrawler:
             "date": date,
             "url": link,
             "content": content,
-            "images": images,
-            "attachments": atts
+            "images": processed_images,
+            "attachments": processed_atts
         })
-
+        return True
+    
 # ==========================================
-# Type A: 일반형
+# Type A: 일반형 (기존과 동일)
 # ==========================================
 class TypeACrawler(BaseCrawler):
     def crawl(self):
         page = 1
         while True:
             print(f"[{self.dept}_{self.detail}] Page {page}...")
-            
-            if '?' in self.base_url:
-                url = f"{self.base_url}&page={page}"
-            else:
-                url = f"{self.base_url}?page={page}"
+            if '?' in self.base_url: url = f"{self.base_url}&page={page}"
+            else: url = f"{self.base_url}?page={page}"
             
             soup = self.fetch_page(url)
             if not soup: break
@@ -110,56 +184,44 @@ class TypeACrawler(BaseCrawler):
                 break
 
             found_regular_post = False
-
             for row in rows:
                 cols = row.find_all("td")
                 if len(cols) < 4: continue
                 
                 is_notice = not cols[0].get_text(strip=True).isdigit()
-                
-                # [수정됨] 1페이지에서는 공지여도 수집합니다! (2페이지부터만 공지 무시)
                 if page > 1 and is_notice: continue 
 
                 found_regular_post = True
-
                 title_elem = row.select_one("td.left a")
                 if not title_elem: continue
                 
                 link = urljoin(self.base_url, title_elem['href'])
-
-                for span in title_elem.find_all('span'):
-                    span.decompose()
+                for span in title_elem.find_all('span'): span.decompose()
                 title = title_elem.get_text(strip=True)
-                
                 date = cols[3].get_text(strip=True)
 
-                # 1페이지는 무조건 통과 (날짜 검사 안 함)
                 if page > 1 and date < self.last_crawled_date:
                     print(f"   ㄴ [Stop] 기준 날짜({self.last_crawled_date}) 도달: {date}")
                     return
 
-                self.process_detail_page(title, date, link)
+                self.process_detail_page(title, date, link,page)
             
-            # 2페이지부터 일반 글이 없으면 종료
             if page > 1 and not found_regular_post:
                 print("   ㄴ [End] 일반 게시글 없음. 종료합니다.")
                 break
-            
             page += 1
+import datetime  # 파일 최상단에 없다면 추가 필요
 
 # ==========================================
-# Type B: 그누보드 (리스트형 포함)
+# Type B: 그누보드 
 # ==========================================
 class TypeBCrawler(BaseCrawler):
     def crawl(self):
         page = 1
         while True:
             print(f"[{self.dept}_{self.detail}] Page {page}...")
-            
-            if '?' in self.base_url:
-                url = f"{self.base_url}&page={page}"
-            else:
-                url = f"{self.base_url}?page={page}"
+            if '?' in self.base_url: url = f"{self.base_url}&page={page}"
+            else: url = f"{self.base_url}?page={page}"
 
             soup = self.fetch_page(url)
             if not soup: break
@@ -176,63 +238,70 @@ class TypeBCrawler(BaseCrawler):
                 break
             
             found_regular_post = False
+            
+            # [수정] 2페이지까지는 강제 수집 모드 활성화
+            is_force_mode = (page <= 2)
 
             for row in rows:
                 is_notice = False
                 
                 if is_list_style:
                     if row.select_one(".notice_icon"): is_notice = True
-                    
                     link_tag = row.find("a")
                     if not link_tag: continue
                     link = urljoin(self.base_url, link_tag['href'])
-                    
                     title_tag = row.select_one("h2") or row.select_one(".subject")
-                    if title_tag:
-                        for span in title_tag.find_all("span"): span.decompose()
-                        title = title_tag.get_text(strip=True)
-                    else: title = "No Title"
-
+                    title = title_tag.get_text(strip=True) if title_tag else "No Title"
                     date_tag = row.select_one(".date")
                     date = date_tag.get_text(strip=True) if date_tag else "2025-01-01"
-
+                
                 else:
                     subj_div = row.select_one(".bo_tit a") or row.select_one(".td_subject a")
                     if not subj_div: continue
-
+                    
                     num_elem = row.select_one(".td_num2") or row.select_one(".td_num")
                     if num_elem and not num_elem.get_text(strip=True).isdigit(): is_notice = True
                     if "bo_notice" in row.get("class", []): is_notice = True
 
                     link = urljoin(self.base_url, subj_div['href'])
-                    if "wr_id" not in link and "bo_table" not in link: continue
-                    
                     title = subj_div.get_text(strip=True)
                     
                     date_elem = row.select_one(".td_datetime")
                     if not date_elem: continue
                     date = date_elem.get_text(strip=True)
-                    if len(date) == 8 and date[2] == '-': date = "20" + date
+                    
+                    if len(date) == 5 and date[2] == '-':
+                        today = datetime.date.today()
+                        try:
+                            post_month = int(date[:2])
+                            year = today.year - 1 if post_month > today.month else today.year
+                            date = f"{year}-{date}"
+                        except:
+                            date = f"{today.year}-{date}"
+                    
+                    elif len(date) == 8 and date[2] == '-':
+                        date = "20" + date
 
-                # [수정됨] 1페이지에서는 공지여도 수집!
                 if page > 1 and is_notice: continue
-
                 found_regular_post = True
 
-                if page > 1 and date < self.last_crawled_date:
+                # [수정] 3페이지부터만 목록 날짜 체크로 조기 중단
+                if not is_force_mode and page > 2 and date < self.last_crawled_date:
                     print(f"   ㄴ [Stop] 기준 날짜({self.last_crawled_date}) 도달: {date}")
                     return
 
-                self.process_detail_page(title, date, link, referer=url)
+                success = self.process_detail_page(title, date, link, referer=url, force_save=is_force_mode)
+
+                if not is_force_mode and not success:
+                    return
             
             if page > 1 and not found_regular_post:
                 print("   ㄴ [End] 일반 게시글 없음. 종료합니다.")
                 break
-            
             page += 1
 
 # ==========================================
-# Type C: 통합홈페이지
+# Type C: 통합홈페이지 (일반/Q&A 범용 호환)
 # ==========================================
 class TypeCCrawler(BaseCrawler):
     def crawl(self):
@@ -241,7 +310,7 @@ class TypeCCrawler(BaseCrawler):
         
         while True:
             page_cnt += 1
-            print(f"[{self.dept}_{self.detail}] Page {page_cnt}...")
+            print(f"[{self.dept}_{self.detail}] Page {page_cnt} reading...")
             
             soup = self.fetch_page(current_url)
             if not soup: break
@@ -252,46 +321,85 @@ class TypeCCrawler(BaseCrawler):
                 break
 
             found_regular_post = False
+            
+            # [추가] 2페이지까지는 강제 수집 모드
+            is_force_mode = (page_cnt <= 2)
 
             for row in rows:
                 cols = row.find_all("td")
-                if len(cols) < 5: continue
+                if len(cols) < 3: continue 
                 
-                is_notice = not cols[0].get_text(strip=True).isdigit()
+                # 공지글 판단
+                first_col_text = cols[0].get_text(strip=True)
+                is_notice = not first_col_text.isdigit()
                 
-                # [수정됨] 1페이지에서는 공지여도 수집!
                 if page_cnt > 1 and is_notice: continue 
-                
-                found_regular_post = True
 
-                title = cols[1].get_text(strip=True)
-                date = cols[4].get_text(strip=True)
-                link_tag = cols[1].find("a")
+                # 비밀글 스킵
+                if row.select("img[src*='secret'], img[alt*='비밀'], img[src*='lock']"):
+                    continue
+
+                # 제목 및 링크 찾기
+                title_tag = None
+                for col in cols[1:]:
+                    a = col.find("a")
+                    if a and a.get_text(strip=True):
+                        title_tag = a
+                        break
                 
-                if not link_tag: continue
-                link = urljoin(self.base_url, link_tag['href'])
+                if not title_tag: continue
                 
-                if page_cnt > 1 and date < self.last_crawled_date:
+                title = title_tag.get_text(strip=True)
+                link = urljoin(self.base_url, title_tag['href'])
+
+                # 날짜 찾기
+                date = ""
+                for col in cols:
+                    txt = col.get_text(strip=True)
+                    match = re.search(r"20\d{2}[-/.](0[1-9]|1[0-2])[-/.](0[1-9]|[12]\d|3[01])", txt)
+                    if match:
+                        date = match.group(0).replace('/', '-').replace('.', '-')
+                        break
+                
+                if not date: date = "2025-01-01"
+
+                # [수정] 3페이지부터만 목록 날짜 체크로 중단
+                if not is_force_mode and page_cnt > 2 and date < self.last_crawled_date:
                     print(f"   ㄴ [Stop] 기준 날짜({self.last_crawled_date}) 도달: {date}")
                     return
                 
-                self.process_detail_page(title, date, link, referer=current_url)
-            
+                found_regular_post = True
+                
+                # [수정] process_detail_page 호출 시 force_save 전달 및 반환값 체크
+                success = self.process_detail_page(title, date, link, referer=current_url, force_save=is_force_mode)
+                
+                # 강제 모드가 아닌데(3페이지 이상) 상세 페이지 날짜가 옛날이면 종료
+                if not is_force_mode and not success:
+                    return
+
+            # 페이지네이션 처리
             if page_cnt > 1 and not found_regular_post:
-                print("   ㄴ [End] 일반 게시글 없음. 종료합니다.")
+                print("   ㄴ [End] 유효한 게시글 없음. 종료.")
                 break
 
             paging = soup.select_one(".paging")
-            if paging and paging.find("strong"):
-                nxt = paging.find("strong").find_next_sibling("a")
-                if nxt: current_url = urljoin(self.base_url, nxt['href'])
+            if paging:
+                current_strong = paging.find("strong")
+                if current_strong:
+                    next_tag = current_strong.find_next_sibling("a")
+                    if next_tag:
+                        current_url = urljoin(self.base_url, next_tag['href'])
+                    else: break
                 else: break
             else: break
 
+# ==========================================
+# 메인 실행부
+# ==========================================
 def get_crawler(target):
     url = target['url']
     if "home.knu.ac.kr" in url: return TypeCCrawler(target)
-    elif "board.php" in url: return TypeBCrawler(target)
+    elif "board" in url: return TypeBCrawler(target)
     else: return TypeACrawler(target)
 
 def process(target):
@@ -303,7 +411,7 @@ def process(target):
 
 if __name__ == "__main__":
     targets = []
-    master_file = "knu_master.jsonl"
+    master_file = "src\crawl\knu.jsonl"
     
     if os.path.exists(master_file):
         with open(master_file, "r", encoding="utf-8") as f:

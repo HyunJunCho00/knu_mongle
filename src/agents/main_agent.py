@@ -1,302 +1,222 @@
-from typing import TypedDict, Annotated, List, Literal
-from langgraph.graph import StateGraph, END
-from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, AIMessage
-from langchain_groq import ChatGroq
-from langchain_core.tools import tool
-from src.core.config import settings
-from src.tools.kakao_map import KakaoMapTool
-from src.tools.email_service import EmailService
-from src.tools.retriever import KNUSearcher
-from src.tools.ocr import OCRTool
-from src.tools.form_filler import FormFillerTool
 import operator
 import json
+from typing import TypedDict, Annotated, List, Dict, Optional, AsyncGenerator, Literal, Any
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, AIMessage
+from langchain_core.tools import tool
+from langchain_google_vertexai import ChatVertexAI
+from langgraph.graph import StateGraph, END
+from langgraph.prebuilt import ToolNode
+# MemorySaver 제거 -> 외부 주입 방식 사용
 
+from src.core.config import settings
+
+
+# --- LangChain 도구 래핑 ---
+@tool
+def search_knu_info(query: str, department: str = "공통") -> str:
+    """
+    경북대학교 공지사항, 장학금, 학사 정보, 비자 정보 등을 검색합니다.
+    중요: 검색 정확도를 위해 'query' 파라미터는 반드시 '한국어(Korean)'로 번역하여 입력해야 합니다.
+    """
+    results = searcher_tool.search(query, target_dept=department)
+    if not results:
+        return "관련 정보를 찾을 수 없습니다."
+    
+    formatted = []
+    for r in results:
+        formatted.append(f"- 제목: {r['title']}\n  내용요약: {r['content'][:200]}...\n  링크: {r['url']}")
+    return "\n".join(formatted)
+
+@tool
+def search_places_near_knu(query: str) -> str:
+    """
+    경북대학교 근처의 맛집, 편의점, 병원 등 장소를 찾거나 길찾기 정보를 제공합니다.
+    중요: 'query'는 되도록 '한국어'로 입력하는 것이 정확도가 높습니다.
+    """
+    result = map_tool.search_near_knu(query)
+    if not result.get("success"):
+        return f"장소 검색 실패: {result.get('error')}"
+    
+    places = result.get("places", [])
+    if not places:
+        return "근처에 해당되는 장소가 없습니다."
+        
+    formatted = []
+    for p in places[:5]:
+        formatted.append(f"- {p['name']} ({p['category']}): {p['distance_text']} 거리, {p['walk_time']}\n  주소: {p['address']}")
+    return "\n".join(formatted)
+
+@tool
+def read_document_text(image_path: str) -> str:
+    """
+    이미지 파일(신분증, 통장, 신청서 등)에서 글자를 읽어옵니다 (OCR).
+    """
+    result = ocr_tool.extract_text_from_image(image_path)
+    if result.get('error'):
+        return f"읽기 실패: {result['error']}"
+    return f"문서 내용:\n{result['text']}"
+
+@tool
+def fill_application_form(template_type: str, data: Dict) -> str:
+    """
+    신청서 양식(Word/PDF)을 작성합니다.
+    """
+    result = form_tool.fill_form(template_type, data)
+    if result['success']:
+        return f"작성 완료! 파일 저장 위치: {result['output_path']}"
+    else:
+        return f"작성 실패: {result['warnings']}"
+
+@tool
+def send_email_draft(recipient: str, subject: str, body: str) -> str:
+    """
+    이메일을 전송합니다. 반드시 승인 절차를 거칩니다.
+    """
+    result = email_tool.send_email(recipient, subject, body)
+    return f"전송 결과: {result['status']}"
+
+TOOLS = [search_knu_info, search_places_near_knu, read_document_text, fill_application_form, send_email_draft]
+
+# --- 상태 정의 ---
 class AgentState(TypedDict):
     messages: Annotated[List[BaseMessage], operator.add]
-    intent: str
-    tool_calls: List[dict]
-    tool_results: List[dict]
-    final_answer: str
+    approval_status: str  # approved, rejected, pending
 
-llm = ChatGroq(
-    model="llama-3.3-70b-versatile",
-    temperature=0,
-    api_key=settings.GROQ_API_KEY
-)
-
-@tool
-def search_database(query: str, dept: str = None) -> str:
-    """
-    Search KNU database for academic information, notices, scholarships, visa info.
-    Args:
-        query: User's search query
-        dept: Optional department filter
-    Returns:
-        Search results as formatted string
-    """
-    searcher = KNUSearcher()
-    results = searcher.search(query, target_dept=dept, final_k=5)
-    
-    if not results:
-        return "No results found"
-    
-    formatted = []
-    for idx, r in enumerate(results, 1):
-        formatted.append(f"[{idx}] {r['title']}\n{r['content'][:200]}...\nURL: {r['url']}\nDept: {r['dept']}\n")
-    
-    return "\n".join(formatted)
-
-@tool
-def search_location(query: str, latitude: str = None, longitude: str = None) -> str:
-    """
-    Search for places, restaurants, or facilities using Kakao Map API.
-    Args:
-        query: Place name or category to search
-        latitude: Optional user location latitude
-        longitude: Optional user location longitude
-    Returns:
-        List of places with navigation links
-    """
-    kakao = KakaoMapTool()
-    results = kakao.search_places(query, x=longitude, y=latitude)
-    
-    if "error" in results:
-        return f"Error: {results['error']}"
-    
-    documents = results.get("documents", [])
-    if not documents:
-        return "No places found"
-    
-    formatted = []
-    for idx, place in enumerate(documents[:5], 1):
-        nav_link = kakao.get_navigation_link(
-            place['place_name'],
-            place['x'],
-            place['y']
-        )
-        formatted.append(
-            f"[{idx}] {place['place_name']}\n"
-            f"Address: {place.get('road_address_name', place.get('address_name'))}\n"
-            f"Phone: {place.get('phone', 'N/A')}\n"
-            f"Navigation: {nav_link}\n"
-        )
-    
-    return "\n".join(formatted)
-
-@tool
-def extract_text_from_image(image_path: str) -> str:
-    """
-    Extract text from an image using OCR (for visa documents, forms, etc.)
-    Args:
-        image_path: Path to the image file
-    Returns:
-        Extracted text
-    """
-    ocr = OCRTool()
-    text = ocr.extract_text_from_image(image_path)
-    return text
-
-@tool
-def parse_visa_document(image_path: str) -> str:
-    """
-    Parse visa-related documents and extract structured information.
-    Args:
-        image_path: Path to visa document image
-    Returns:
-        Structured visa information
-    """
-    ocr = OCRTool()
-    text = ocr.extract_text_from_image(image_path)
-    info = ocr.parse_visa_info(text)
-    return json.dumps(info, ensure_ascii=False, indent=2)
-
-@tool
-def fill_form_template(template_type: str, user_data: dict) -> str:
-    """
-    Fill out application forms (HWP, Word, PDF) with user data.
-    Args:
-        template_type: Type of form (scholarship, visa, enrollment, etc.)
-        user_data: Dictionary containing user information
-    Returns:
-        Path to filled form file
-    """
-    filler = FormFillerTool()
-    template_path = f"templates/{template_type}.docx"
-    output_path = f"output/{template_type}_filled.docx"
-    
-    result = filler.fill_form(template_path, user_data, output_path)
-    return f"Form filled successfully: {result}"
-
-@tool
-def draft_email(recipient: str, subject: str, body: str) -> str:
-    """
-    Draft an email for the user to review before sending.
-    Args:
-        recipient: Email recipient
-        subject: Email subject
-        body: Email body content
-    Returns:
-        Email draft information
-    """
-    email_service = EmailService()
-    draft = email_service.draft_email(recipient, subject, body)
-    return json.dumps(draft, ensure_ascii=False, indent=2)
-
-@tool
-def send_email(recipient: str, subject: str, body: str) -> str:
-    """
-    Send an email on behalf of the user (requires confirmation).
-    Args:
-        recipient: Email recipient
-        subject: Email subject
-        body: Email body content
-    Returns:
-        Send status
-    """
-    email_service = EmailService()
-    result = email_service.send_email(recipient, subject, body)
-    return json.dumps(result, ensure_ascii=False)
-
-TOOLS = [
-    search_database,
-    search_location,
-    extract_text_from_image,
-    parse_visa_document,
-    fill_form_template,
-    draft_email,
-    send_email
-]
-
-tools_by_name = {tool.name: tool for tool in TOOLS}
-
-def router_node(state: AgentState):
-    """Analyze user intent and determine required tools"""
-    last_msg = state['messages'][-1].content
-    
-    system_prompt = f"""You are an intent classifier for a university assistant system.
-Available tools:
-- search_database: Academic info, notices, scholarships, visa information
-- search_location: Places, restaurants, facilities (Kakao Map)
-- extract_text_from_image: OCR for any image
-- parse_visa_document: Structured visa document parsing
-- fill_form_template: Fill application forms
-- draft_email: Create email drafts
-- send_email: Send emails
-
-Analyze the user query and respond with ONLY a JSON object:
-{{
-  "intent": "INFO_SEARCH|LOCATION|OCR|VISA|FORM|EMAIL|GENERAL",
-  "required_tools": ["tool_name1", "tool_name2"],
-  "parameters": {{"param_key": "param_value"}}
-}}
-
-User query: {last_msg}"""
-    
-    response = llm.invoke([SystemMessage(content=system_prompt)])
-    
-    try:
-        result = json.loads(response.content)
-        return {
-            "intent": result.get("intent", "GENERAL"),
-            "tool_calls": [{
-                "tool": t,
-                "params": result.get("parameters", {})
-            } for t in result.get("required_tools", [])]
-        }
-    except:
-        return {"intent": "GENERAL", "tool_calls": []}
-
-def tool_executor_node(state: AgentState):
-    """Execute all required tools"""
-    results = []
-    
-    for tool_call in state.get("tool_calls", []):
-        tool_name = tool_call["tool"]
-        params = tool_call["params"]
+# --- 에이전트 클래스 ---
+class KNUVertexAgent:
+    def __init__(self, checkpointer: Any):
+        """
+        Args:
+            checkpointer: AsyncPostgresSaver 인스턴스를 주입받음
+        """
+        self.checkpointer = checkpointer
         
-        if tool_name in tools_by_name:
-            try:
-                tool_func = tools_by_name[tool_name]
-                result = tool_func.invoke(params)
-                results.append({
-                    "tool": tool_name,
-                    "result": result
-                })
-            except Exception as e:
-                results.append({
-                    "tool": tool_name,
-                    "error": str(e)
-                })
-    
-    return {"tool_results": results}
-
-def answer_generator_node(state: AgentState):
-    """Generate final answer using tool results"""
-    tool_results = state.get("tool_results", [])
-    user_query = state['messages'][-1].content
-    
-    if not tool_results:
-        prompt = f"User query: {user_query}\n\nProvide a helpful response."
-    else:
-        results_text = "\n\n".join([
-            f"Tool: {r['tool']}\nResult: {r.get('result', r.get('error'))}"
-            for r in tool_results
-        ])
-        prompt = f"""User query: {user_query}
-
-Tool Results:
-{results_text}
-
-Based on the above information, provide a comprehensive and helpful answer to the user."""
-    
-    response = llm.invoke([HumanMessage(content=prompt)])
-    
-    return {
-        "messages": [AIMessage(content=response.content)],
-        "final_answer": response.content
-    }
-
-def route_after_intent(state: AgentState) -> Literal["execute_tools", "generate_answer"]:
-    """Decide whether to execute tools or answer directly"""
-    if state.get("tool_calls"):
-        return "execute_tools"
-    return "generate_answer"
-
-workflow = StateGraph(AgentState)
-
-workflow.add_node("router", router_node)
-workflow.add_node("execute_tools", tool_executor_node)
-workflow.add_node("generate_answer", answer_generator_node)
-
-workflow.set_entry_point("router")
-
-workflow.add_conditional_edges(
-    "router",
-    route_after_intent,
-    {
-        "execute_tools": "execute_tools",
-        "generate_answer": "generate_answer"
-    }
-)
-
-workflow.add_edge("execute_tools", "generate_answer")
-workflow.add_edge("generate_answer", END)
-
-agent_app = workflow.compile()
-
-class KNUAgent:
-    def __init__(self):
-        self.app = agent_app
-    
-    def process_query(self, query: str, context: dict = None):
-        initial_state = {
-            "messages": [HumanMessage(content=query)],
-            "intent": "",
-            "tool_calls": [],
-            "tool_results": [],
-            "final_answer": ""
-        }
+        # Vertex AI Gemini 설정 (Gemini 3.0 Flash)
+        self.llm = ChatVertexAI(
+            
+            model_name="gemini-3.0-flash", 
+            project=settings.GOOGLE_CLOUD_PROJECT,
+            location=settings.GOOGLE_CLOUD_LOCATION,
+            temperature=0, 
+            convert_system_message_to_human=True 
+        )
+        self.llm_with_tools = self.llm.bind_tools(TOOLS)
         
-        result = self.app.invoke(initial_state)
-        return result.get("final_answer", "Unable to process query")
+        # 워크플로우 컴파일
+        self.app = self._build_workflow()
+
+    def _build_workflow(self):
+        workflow = StateGraph(AgentState)
+        
+        workflow.add_node("agent", self._agent_node)
+        workflow.add_node("tools", ToolNode(TOOLS))
+        
+        workflow.set_entry_point("agent")
+        
+        workflow.add_conditional_edges(
+            "agent",
+            self._route_tools,
+            {
+                "tools": "tools",
+                "approval_required": END, # Human-in-the-loop 대기
+                END: END
+            }
+        )
+        
+        workflow.add_edge("tools", "agent")
+        
+        # 주입받은 PostgresSaver 사용
+        return workflow.compile(checkpointer=self.checkpointer)
+
+    def _agent_node(self, state: AgentState):
+        messages = state['messages']
+        
+        system_msg = """당신은 경북대학교(KNU) 외국인 유학생을 돕는 AI 에이전트입니다.
+        
+        [행동 수칙]
+        1. **언어**: 사용자의 질문 언어로 답변하세요.
+        2. **도구 호출**: 검색 도구의 'query' 인자는 반드시 **한국어**로 번역해서 넣으세요.
+           - User: "Scholarship deadline?" -> Tool: search_knu_info(query="장학금 마감일")
+        3. **판단**: 확실하지 않으면 추측하지 말고 검색하거나 문서를 읽으세요.
+        """
+        
+        if not isinstance(messages[0], SystemMessage):
+            messages = [SystemMessage(content=system_msg)] + messages
+            
+        # 거절된 상태라면 도구 호출 안 함
+        if state.get("approval_status") == "rejected":
+             return {
+                "messages": [AIMessage(content="사용자가 작업을 취소했습니다. 다른 도움이 필요하신가요?")],
+                "approval_status": "pending" # 상태 초기화
+            }
+
+        response = self.llm_with_tools.invoke(messages)
+        return {"messages": [response]}
+
+    def _route_tools(self, state: AgentState) -> Literal["tools", "approval_required", END]:
+        last_message = state['messages'][-1]
+        
+        if not last_message.tool_calls:
+            return END
+            
+        # 민감한 도구 체크
+        SENSITIVE_TOOLS = ["send_email_draft", "fill_application_form"]
+        for tool_call in last_message.tool_calls:
+            if tool_call["name"] in SENSITIVE_TOOLS:
+                if state.get("approval_status") != "approved":
+                    return "approval_required"
+        
+        return "tools"
+
+    async def process_query(self, query: str, thread_id: str) -> AsyncGenerator[Any, None]:
+        config = {"configurable": {"thread_id": thread_id}}
+        
+        # 현재 상태 확인 (승인 대기 중이었는지)
+        current_state = await self.app.aget_state(config)
+        if current_state.next and not query: 
+            # 쿼리가 비어있는데 상태가 남아있으면 이어서 진행 (승인 후 로직 등)
+            inputs = None
+        else:
+            inputs = {"messages": [HumanMessage(content=query)]}
+
+        async for event in self.app.astream_events(inputs, config, version="v1"):
+            kind = event["event"]
+            
+            if kind == "on_chat_model_stream":
+                content = event["data"]["chunk"].content
+                if content:
+                    yield content
+            
+            elif kind == "on_tool_start":
+                yield f"\n[System: {event['name']} 실행 중...]\n"
+                
+            elif kind == "on_tool_end":
+                # 도구 결과는 JSON 형태로 보낼 수도 있음
+                pass
+
+        # 종료 후 상태 확인 (승인 대기 여부)
+        snapshot = await self.app.aget_state(config)
+        if snapshot.next:
+            last_msg = snapshot.values["messages"][-1]
+            if hasattr(last_msg, 'tool_calls') and last_msg.tool_calls:
+                 # 클라이언트가 인식할 수 있는 승인 요청 마커 전송
+                yield "\n[APPROVAL_REQUIRED]" 
+
+    async def approve_tool(self, conversation_id: str, approved: bool) -> AsyncGenerator[str, None]:
+        """승인/거절 처리 후 워크플로우 재개 (스트리밍)"""
+        config = {"configurable": {"thread_id": conversation_id}}
+        
+        status = "approved" if approved else "rejected"
+        
+        # 상태 업데이트
+        await self.app.aupdate_state(config, {"approval_status": status})
+        
+        # 멈춘 지점부터 다시 실행 (None 입력으로 재개)
+        async for event in self.app.astream_events(None, config, version="v1"):
+            kind = event["event"]
+            if kind == "on_chat_model_stream":
+                content = event["data"]["chunk"].content
+                if content:
+                    yield content
+            elif kind == "on_tool_start":
+                yield f"\n[System: {event['name']} 실행 중...]\n"

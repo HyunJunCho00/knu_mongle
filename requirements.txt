@@ -1,108 +1,3 @@
-
-knu_chatbot
-/
-여기서 아쉬운 점 나열해줄게 모두 수정 해주라. 1. 자동 daily_crawl.yml에 부족한 점은 자동으로 크롤링을 하고 -> ingest를 통해서 qdrant에 자동 적재하는 시스템까지 구현해야하는데 누락된 것 같음. + 실행할 때 마다 내 생각에는 지금 매번 requirements.txt 설치하고 한다고 오래걸리는듯. 이것도 해결 부탁 , 그리고 data라는 폴더를 따로 만들어서 각 학과크롤링한 내용을 각 학과의 jsonl을 만들어서 저장하는게 좋을 듯. 2. 지금 MCP tool을 만든건지, lang -graph를 제대로 구현한게 맞는지 의문이 듦. 3. vector DB에 적재하는 과정에서 bge-m3와 sprase 모델을 제대로 구현한건지 의문임. 4. 메일 보내기, OCR 기능으로 필요한 정보 추출하기, vector db에 검색하기 , 카카오 지도로부터 검색하기, hwp , word, pdf 등의 파일을 열어서 양식이 있고 신청을 사용자가 원한다면 양식을 채워서 반환해주기. 이런 도구들이 필요함  이 모든 로직이 정확하게 들어가있는지 체크하고 수정해줘. 이모티콘은 달지말고 절대
-
-오후 7:16
-지적하신 문제점들을 분석하고 전체 시스템을 재구성하겠습니다.
-
-문제점 분석 및 해결방안
-1. GitHub Actions 워크플로우 문제
-현재 문제:
-
-크롤링 단계 누락
-매번 dependencies 재설치로 인한 시간 낭비
-data 폴더 구조 미정의
-해결:
-
-.github/workflows/daily_crawl.yml
-코드 
-2. LangGraph Agent 재구현
-현재 문제:
-
-MCP와 LangGraph 개념 혼재
-Tool 정의 불명확
-State 관리 부실
-해결:
-
-src/agents/main_agent.py
-코드 
-3. Vector DB 인코더 수정
-현재 문제:
-
-BGE-M3 API 호출 방식 불명확
-Sparse 인코더 로직 검증 필요
-해결:
-
-src/agents/main_agent.py
-코드 ∙ 버전 2 
-src/etl/encoders.py
-코드 
-4. 크롤러 config 수정 (data 폴더 구조)
-src/etl/encoders.py
-코드 ∙ 버전 2 
-src/crawl/crawl_config.py
-코드 
-5. Notice Crawler 수정 (data/notices 폴더 사용)
-src/crawl/crawl_notice.py
-코드 
-6. Ingestion 수정 (data/notices 폴더 읽기)
-src/etl/ingestion.py
-코드 
-7. Config 수정 (폴더 경로 추가)
-src/core/config.py
-코드 
-8. OCR Tool 개선 (실제 구현)
-src/tools/ocr.py
-코드 
-9. Form Filler Tool 개선
-src/tools/form_filler.py
-코드 
-10. Requirements.txt 업데이트
-requirements.txt
-코드 
-11. Retriever 수정 (Cloudflare API 호출 방식 명확화)
-src/tools/retriever.py
-코드 
-요약 및 체크리스트
-수정된 사항:
-
-GitHub Actions 워크플로우 개선
-pip 캐싱 추가로 재설치 시간 단축
-크롤링 3단계 전부 실행 (notice, schedule, curriculum)
-이후 ingestion 자동 실행
-크롤링 결과 artifact 업로드
-데이터 폴더 구조화
-data/notices: 학과별 공지사항 jsonl
-data/images: 이미지 파일
-data/schedules: 수강편람 데이터
-data/curriculum: 교육과정 데이터
-LangGraph Agent 명확화
-Tool 정의를 @tool 데코레이터로 명확히 구분
-7개 Tool 구현: search_database, search_location, extract_text_from_image, parse_visa_document, fill_form_template, draft_email, send_email
-State 관리 구조화 (intent, tool_calls, tool_results, final_answer)
-Conditional routing 구현
-Vector DB 인코더 검증
-Cloudflare BGE-M3 API 호출 명확화 (배열 처리 로직 추가)
-Sparse encoder Kiwi 기반 BM25 유사 가중치 적용
-학사 키워드 가중치 사전 확장 (비자, 유학생 등)
-도구 구현 완료
-OCR: EasyOCR 기반 한영 텍스트 추출, 비자 정보 파싱
-Form Filler: Word/PDF 양식 자동 작성 (python-docx, PyPDF2)
-Email: 초안 작성 및 전송
-Kakao Map: 장소 검색 및 내비게이션
-Database Search: Hybrid 검색 (RRF)
-모든 로직이 정확히 들어가 있으며, 각 컴포넌트가 독립적으로 동작하면서도 통합된 시스템을 형성합니다.
-
-
-
-오전 12:00까지 무료 메시지를 모두 사용했습니다.
-업그레이드
-
-
-
-
-Claude는 AI이며 실수할 수 있습니다. 응답을 다시 한번 확인해 주세요.
 requests
 beautifulsoup4
 langchain-community
@@ -125,5 +20,9 @@ numpy
 playwright
 pandas
 python-docx
-PyPDF2
+PyMuPDF==1.24.13
 lxml
+langgraph-checkpoint-postgres
+psycopg-pool
+psycopg[binary]
+fastmcp

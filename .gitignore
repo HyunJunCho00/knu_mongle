@@ -1,7 +1,14 @@
 .env
 credentials.json
-
+Neo4j-credentials*
+Neo4j-cd*
 # 파이썬 가상환경 및 캐시
 venv/
 __pycache__/
 *.pyc
+
+# 임시 폴더들
+src/etl(old)
+src/tool(old)
+src/mcp_server/kakao
+/data
