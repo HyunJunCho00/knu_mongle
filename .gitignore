@@ -1,6 +1,32 @@
 .env
+credentials.json
+Neo4j-credentials*
+Neo4j-cd*
 
-# 파이썬 가상환경 및 캐시
+# Python
 venv/
 __pycache__/
 *.pyc
+
+# Local-only folders/files
+src/mcp_server/kakao
+/data
+jsonl_only_backup.zip
+
+# Ingestion/metadata outputs (never commit)
+metadata_v2/
+metadata_v2_migrated/
+**/*_metadata.jsonl
+qdrant_upload.json
+qdrant_upload.log
+
+# Binary attachments/images from crawl (never commit)
+data/attachments/
+data/notices/
+data/schedules/
+data/curriculum/
+output/
+
+# Notebooks
+*.ipynb
+

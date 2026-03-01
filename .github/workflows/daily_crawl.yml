@@ -2,7 +2,7 @@ name: Daily KNU Info Crawl & Ingest
 
 on:
   schedule:
-    - cron: '0 21 * * *'  # KST 06:00
+    - cron: '0 21 * * *'  # KST 06:00 (UTC 21:00)
   workflow_dispatch:
 
 jobs:
@@ -11,15 +11,15 @@ jobs:
     
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4
 
     - name: Set up Python
-      uses: actions/setup-python@v4
+      uses: actions/setup-python@v5
       with:
         python-version: '3.10'
 
     - name: Cache pip dependencies
-      uses: actions/cache@v3
+      uses: actions/cache@v4
       with:
         path: ~/.cache/pip
         key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
@@ -34,26 +34,30 @@ jobs:
     - name: Create data directories
       run: |
         mkdir -p data/notices
-        mkdir -p data/images
         mkdir -p data/schedules
+        mkdir -p data/curriculum
+        mkdir -p data/attachments
 
     - name: Run Notice Crawler
       env:
         PYTHONPATH: ${{ github.workspace }}
       run: |
         python src/crawl/crawl_notice.py
+      continue-on-error: false
 
     - name: Run Schedule Crawler
       env:
         PYTHONPATH: ${{ github.workspace }}
       run: |
         python src/crawl/crawl_schedule.py
+      continue-on-error: true
 
     - name: Run Curriculum Crawler
       env:
         PYTHONPATH: ${{ github.workspace }}
       run: |
         python src/crawl/crawl_curriculum.py
+      continue-on-error: true
 
     - name: Run Ingestion to Qdrant
       env:
@@ -67,16 +71,17 @@ jobs:
         python src/etl/ingestion.py
 
     - name: Upload crawled data as artifacts
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: crawled-data
         path: data/
         retention-days: 7
+      if: always()
 
     - name: Commit and push data (optional)
       run: |
         git config --local user.email "action@github.com"
         git config --local user.name "GitHub Action"
         git add data/
-        git diff --quiet && git diff --staged --quiet || (git commit -m "Auto-update crawled data" && git push)
+        git diff --quiet && git diff --staged --quiet || (git commit -m "Auto-update crawled data [$(date +'%Y-%m-%d %H:%M:%S')]" && git push)
       continue-on-error: true
