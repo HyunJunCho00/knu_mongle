@@ -1,6 +1,9 @@
 import os
 from urllib.parse import urljoin
-from crawl.crawl_config import CONFIG
+try:
+    from crawl_config import CONFIG
+except ImportError:
+    from src.crawl.crawl_config import CONFIG
 
     
 def parse_post_content(soup, url):
@@ -100,7 +103,8 @@ def parse_post_content(soup, url):
                 continue
             
             ext = os.path.splitext(name)[1].lower()
-            if ext in CONFIG.get("download_file_exts", []):
+            downloadable_exts = set(CONFIG.get("download_file_exts", [])) | set(CONFIG.get("image_exts", []))
+            if ext in downloadable_exts:
                 attachments.append({"name": name, "url": full_url})
                 seen_urls.add(full_url)
 

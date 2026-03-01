@@ -1,167 +1,249 @@
+import json
 import os
+import re
 import time
-import mmh3
-import numpy as np
-from typing import List, Optional, Tuple, Dict, Any
-from collections import Counter
+from typing import Any, Dict, List, Optional
+
+import httpx
 from qdrant_client import QdrantClient, models
-from kiwipiepy import Kiwi
-from ..cloudflare_client import cf_client
+
 
 class HybridRetriever:
     """
-    하이브리드 검색 시스템
-    - Dense: Cloudflare BGE-M3 임베딩
-    - Sparse: Kiwi 형태소 분석 + MMH3 해싱
-    - Qdrant을 이용한 벡터/그래프 검색
+    Hybrid retriever with:
+    - Query decomposition
+    - Hybrid dense+sparse retrieval
+    - Rule-based reranking
+    - Query-time context packing (neighbor nodes)
     """
-    
+
     def __init__(self):
         self.qdrant_client = QdrantClient(
             url=os.getenv("QDRANT_URL"),
             api_key=os.getenv("QDRANT_API_KEY"),
-            timeout=30
+            timeout=30,
+            cloud_inference=True,
         )
-        self.collection_name = os.getenv("COLLECTION_NAME", "campus_docs")
-        self.kiwi = Kiwi(model_type='sbg')
-        self.stop_tags = {'JKS', 'JKC', 'JKG', 'JKO', 'JKB', 'JKV', 'JKQ', 'JX', 'JC', 'EP', 'EF'}
-    
+        self.collection_name = os.getenv("COLLECTION_NAME", "school_notice")
+
+        self.account_id = os.getenv("CF_ACCOUNT_ID") or os.getenv("CLOUDFLARE_ACCOUNT_ID")
+        self.api_token = os.getenv("CF_API_TOKEN") or os.getenv("CLOUDFLARE_API_TOKEN")
+        self.dense_model = "@cf/baai/bge-m3"
+        self.node_type_weight = {
+            "section": 1.12,
+            "table_row": 1.10,
+            "list_item": 1.06,
+            "paragraph": 1.0,
+        }
+
     async def _encode_dense(self, text: str) -> List[float]:
-        """Cloudflare BGE-M3 임베딩 생성"""
-        account_id = os.getenv("CLOUDFLARE_ACCOUNT_ID")
-        api_token = os.getenv("CLOUDFLARE_API_TOKEN")
-        
-        url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/@cf/baai/bge-m3"
-        headers = {"Authorization": f"Bearer {api_token}"}
-        
+        if not self.account_id or not self.api_token:
+            return [0.0] * 1024
+
+        url = f"https://api.cloudflare.com/client/v4/accounts/{self.account_id}/ai/run/{self.dense_model}"
+        headers = {"Authorization": f"Bearer {self.api_token}"}
+
         try:
-            async with httpx.AsyncClient() as client:
-                response = await client.post(
-                    url,
-                    headers=headers,
-                    json={"text": [text]},
-                    timeout=10
-                )
+            async with httpx.AsyncClient(timeout=12) as client:
+                response = await client.post(url, headers=headers, json={"text": [text]})
                 response.raise_for_status()
                 result = response.json()
-                return result["result"]["data"][0]
-        except Exception as e:
-            print(f"Dense encoding error: {e}")
-            return [0.0] * 1024
-    
-    def _encode_sparse(self, text: str) -> Tuple[Optional[List[int]], Optional[List[float]]]:
-        """Kiwi 형태소 분석을 이용한 sparse 벡터 생성"""
-        tokens = self.kiwi.tokenize(text)
-        keywords = [
-            t.form for t in tokens
-            if t.tag not in self.stop_tags and len(t.form) > 1 and not t.form.isdigit()
+                vectors = result.get("result", {}).get("data", [])
+                if vectors and isinstance(vectors[0], list):
+                    return vectors[0]
+                if isinstance(vectors, list) and len(vectors) == 1024:
+                    return vectors
+        except Exception:
+            pass
+        return [0.0] * 1024
+
+    @staticmethod
+    def _build_sparse_query(text: str) -> models.Document:
+        return models.Document(text=text, model="qdrant/bm25")
+
+    @staticmethod
+    def _decompose_query(query: str) -> List[str]:
+        q = query.strip()
+        if not q:
+            return []
+        splits = re.split(r"\?|,| 그리고 | 및 | 또는 |/|;", q)
+        subs = [s.strip() for s in splits if len(s.strip()) >= 2]
+        if not subs:
+            return [q]
+        # keep top 3 sub-queries + original
+        out = subs[:3]
+        if q not in out:
+            out.append(q)
+        return out
+
+    @staticmethod
+    def _tokenize_for_overlap(text: str) -> List[str]:
+        return re.findall(r"[가-힣A-Za-z0-9]{2,}", (text or "").lower())
+
+    def _rerank(self, query: str, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        q_tokens = set(self._tokenize_for_overlap(query))
+        reranked = []
+        for item in items:
+            payload = item.get("payload", {})
+            content = payload.get("content", "")
+            title = payload.get("title", "")
+            combined = f"{title} {content}"
+            d_tokens = set(self._tokenize_for_overlap(combined))
+            overlap = len(q_tokens.intersection(d_tokens))
+            base = float(item.get("score", 0.0))
+            node_type = payload.get("node_type", payload.get("chunk_type", "paragraph"))
+            nt_w = self.node_type_weight.get(node_type, 1.0)
+            rerank_score = (base * nt_w) + (0.015 * overlap)
+            item["rerank_score"] = rerank_score
+            reranked.append(item)
+        reranked.sort(key=lambda x: x.get("rerank_score", 0.0), reverse=True)
+        return reranked
+
+    def _pack_neighbors(self, item: Dict[str, Any]) -> Dict[str, Any]:
+        payload = item.get("payload", {})
+        doc_url = payload.get("url")
+        idx = payload.get("chunk_index")
+        if doc_url is None or idx is None:
+            return item
+
+        try:
+            idx_int = int(idx)
+        except (TypeError, ValueError):
+            return item
+
+        must = [
+            models.FieldCondition(key="url", match=models.MatchValue(value=doc_url)),
+            models.FieldCondition(
+                key="chunk_index",
+                range=models.Range(gte=max(idx_int - 1, 0), lte=idx_int + 1),
+            ),
         ]
-        
-        if not keywords:
-            return None, None
-        
-        term_counts = Counter(keywords)
-        indices = []
-        values = []
-        
-        for term, count in term_counts.items():
-            idx = mmh3.hash(term, signed=False)
-            val = float(np.sqrt(count))
-            indices.append(idx)
-            values.append(val)
-        
-        return indices, values
-    
-    async def search(
-        self,
-        query: str,
-        department: str = None,
-        limit: int = 5
-    ) -> Dict[str, Any]:
-        """
-        하이브리드 검색 실행
-        
-        Args:
-            query: 검색 쿼리
-            department: 부서 필터 (선택적)
-            limit: 반환할 결과 수
-        
-        Returns:
-            Dict: 검색 결과 및 메타데이터
-        """
-        start_time = time.time()
-        
-        # Dense 및 Sparse 벡터 병렬 생성
+        filt = models.Filter(must=must)
+        neighbors, _ = self.qdrant_client.scroll(
+            collection_name=self.collection_name,
+            scroll_filter=filt,
+            with_payload=True,
+            with_vectors=False,
+            limit=5,
+        )
+        neighbors_sorted = sorted(
+            neighbors,
+            key=lambda p: int((p.payload or {}).get("chunk_index", 0)),
+        )
+        context = "\n\n".join([(p.payload or {}).get("content", "") for p in neighbors_sorted if (p.payload or {}).get("content")])
+        if context:
+            item["packed_context"] = context
+        return item
+
+    async def _search_once(self, query: str, department: Optional[str], limit: int) -> List[Dict[str, Any]]:
         dense_task = self._encode_dense(query)
-        sparse_result = self._encode_sparse(query)
-        
+        sparse_doc = self._build_sparse_query(query)
         dense_vec = await dense_task
-        sp_indices, sp_values = sparse_result
-        
-        # 필터 구성
+
         search_filter = None
         if department and department != "공통":
             search_filter = models.Filter(
-                must=[models.FieldCondition(
-                    key="dept",
-                    match=models.MatchValue(value=department)
-                )]
+                must=[models.FieldCondition(key="dept", match=models.MatchValue(value=department))]
             )
-        
-        # Qdrant 검색 쿼리 구성
+
         prefetch = [
-            models.Prefetch(
-                query=dense_vec,
-                using="dense",
-                limit=50,
-                filter=search_filter
-            )
+            models.Prefetch(query=dense_vec, using="dense", limit=max(50, limit * 6), filter=search_filter)
         ]
-        
-        if sp_indices:
-            prefetch.append(models.Prefetch(
-                query=models.SparseVector(indices=sp_indices, values=sp_values),
+        prefetch.append(
+            models.Prefetch(
+                query=sparse_doc,
                 using="sparse",
-                limit=50,
-                filter=search_filter
-            ))
-        
-        # Qdrant 검색 실행
+                limit=max(50, limit * 6),
+                filter=search_filter,
+            )
+        )
+
         results = self.qdrant_client.query_points(
             collection_name=self.collection_name,
             prefetch=prefetch,
             query=models.FusionQuery(fusion=models.Fusion.RRF),
-            limit=limit,
-            with_payload=True
+            limit=max(30, limit * 4),
+            with_payload=True,
+            with_vectors=False,
         )
-        
-        # 결과 파싱
+
+        out = []
+        for p in results.points:
+            out.append({"id": p.id, "score": float(p.score), "payload": p.payload or {}})
+        return out
+
+    async def search(
+        self,
+        query: str,
+        department: str = None,
+        limit: int = 5,
+    ) -> Dict[str, Any]:
+        start_time = time.time()
+        sub_queries = self._decompose_query(query)
+        if not sub_queries:
+            return {
+                "status": "success",
+                "query": query,
+                "sub_queries": [],
+                "results_count": 0,
+                "processing_time_ms": int((time.time() - start_time) * 1000),
+                "results": [],
+            }
+
+        merged: Dict[str, Dict[str, Any]] = {}
+        for sq in sub_queries:
+            one = await self._search_once(sq, department=department, limit=limit)
+            for item in one:
+                key = str(item.get("id"))
+                if key not in merged:
+                    merged[key] = item
+                else:
+                    # keep best original hybrid score
+                    merged[key]["score"] = max(float(merged[key]["score"]), float(item["score"]))
+
+        reranked = self._rerank(query, list(merged.values()))
+        selected = reranked[: max(limit * 2, 6)]
+        packed = [self._pack_neighbors(it) for it in selected]
+        final = packed[:limit]
+
         parsed_results = []
-        for point in results.points:
-            payload = point.payload or {}
-            parsed_results.append({
-                "score": float(point.score),
-                "title": payload.get("title", ""),
-                "content": payload.get("content", ""),
-                "url": payload.get("url", ""),
-                "dept": payload.get("dept", ""),
-                "date": payload.get("date", "")
-            })
-        
+        for it in final:
+            payload = it.get("payload", {})
+            parsed_results.append(
+                {
+                    "score": float(it.get("rerank_score", it.get("score", 0.0))),
+                    "title": payload.get("title", ""),
+                    "content": payload.get("content", ""),
+                    "packed_context": it.get("packed_context", payload.get("content", "")),
+                    "url": payload.get("url", ""),
+                    "dept": payload.get("dept", ""),
+                    "date": payload.get("date", ""),
+                    "node_type": payload.get("node_type", payload.get("chunk_type", "")),
+                    "node_path": payload.get("node_path", ""),
+                    "section_header": payload.get("section_header", ""),
+                    "evidence": {
+                        "point_id": str(it.get("id", "")),
+                        "source_url": payload.get("url", ""),
+                        "section_path": payload.get("node_path", ""),
+                        "chunk_index": payload.get("chunk_index", -1),
+                    },
+                }
+            )
+
         elapsed = time.time() - start_time
-        
         return {
             "status": "success",
             "query": query,
+            "sub_queries": sub_queries,
             "results_count": len(parsed_results),
             "processing_time_ms": int(elapsed * 1000),
-            "results": parsed_results
+            "results": parsed_results,
         }
 
-# MCP 도구용 인터페이스
+
 retriever = HybridRetriever()
 
+
 async def campus_search_tool(query: str, department: str = None, limit: int = 5) -> str:
-    """캠퍼스 문서 검색 MCP 도구"""
     result = await retriever.search(query, department, limit)
     return json.dumps(result, ensure_ascii=False)

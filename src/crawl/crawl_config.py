@@ -1,8 +1,12 @@
 import os
 import re
 import json
+from datetime import date, timedelta
 from pathlib import Path
-from core.config import Settings
+try:
+    from core.config import Settings
+except ImportError:
+    from src.core.config import Settings
 
 CURRENT_FILE = Path(__file__).resolve()
 PROJECT_ROOT = CURRENT_FILE.parent.parent.parent
@@ -13,6 +17,11 @@ SCHEDULES_DIR = Settings.SCHEDULES_DIR
 CURRICULUM_DIR = Settings.CURRICULUM_DIR
 ATTACHMENTS_DIR=Settings.ATTACHMENTS_DIR
 
+# Crawl policy (fixed constants)
+COLD_START = True
+COLD_START_DATE = "2026-01-01"
+CUTOFF_DATE = COLD_START_DATE if COLD_START else (date.today() - timedelta(days=5)).strftime("%Y-%m-%d")
+
 CONFIG = {
     "project_root": str(PROJECT_ROOT),
     "data_dir": str(DATA_DIR),
@@ -21,13 +30,16 @@ CONFIG = {
     "curriculum_dir": str(CURRICULUM_DIR),
     "attachments_dir": str(ATTACHMENTS_DIR),  
     
-    "cutoff_date": "2025-01-01",
-    "max_workers": 10,
-    "max_file_workers":4,
-    "max_image_workers":3,
-    "request_delay":0.05,
-    "extract_text_exts": [".pdf", ".docx", ".hwp"],
-    "download_file_exts": [".pdf", ".docx", ".hwp", ".xlsx", ".xls", ".pptx"],
+    "cold_start": COLD_START,
+    "cold_start_date": COLD_START_DATE,
+    "cutoff_date": CUTOFF_DATE,
+    "max_workers": 20,
+    "max_file_workers": 6,
+    "max_image_workers": 6,
+    "request_delay": 0.02,
+    "extract_text_exts": [".pdf", ".docx", ".hwp", ".hwpx", ".xlsx", ".xls", ".pptx", ".txt", ".csv"],
+    "download_file_exts": [".pdf", ".docx", ".hwp", ".hwpx", ".xlsx", ".xls", ".pptx"],
+    "image_exts": [".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tiff"],
     "headers": {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",

@@ -7,6 +7,11 @@ load_dotenv()
 class Settings:
     # LLM Configuration
     GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+    LLM_MODE = os.getenv("LLM_MODE", "auto")  # auto | qwen_local | groq
+    LOCAL_VLM_ID = os.getenv("LOCAL_VLM_ID", "Qwen/Qwen2-VL-7B-Instruct")
+    GROQ_VISION_MODEL = os.getenv(
+        "GROQ_VISION_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct"
+    )
     
     # Vertex AI / Gemini Configuration
     GOOGLE_CLOUD_PROJECT = os.getenv("GOOGLE_CLOUD_PROJECT")
