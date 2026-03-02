@@ -1,4 +1,4 @@
-import datetime
+﻿import datetime
 import io
 import json
 import os
@@ -6,8 +6,10 @@ import re
 import threading
 import time
 import urllib3
+import hashlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from typing import Dict, List, Optional
 from urllib.parse import urljoin
 
 import requests
@@ -39,23 +41,147 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 file_lock = threading.Lock()
 
 
+def _normalize_id(raw_value: str, fallback_seed: str, prefix: str, fallback_label: str = "") -> str:
+    base = (raw_value or "").strip().lower()
+    base = re.sub(r"[^a-z0-9_-]+", "-", base)
+    base = re.sub(r"-{2,}", "-", base).strip("-_")
+    if base:
+        return base
+    if fallback_label:
+        readable = sanitize_filename(fallback_label).strip().lower()
+        readable = re.sub(r"\s+", "-", readable)
+        readable = re.sub(r"-{2,}", "-", readable).strip("-_")
+        if readable:
+            return readable
+    digest = hashlib.sha1(fallback_seed.encode("utf-8")).hexdigest()[:10]
+    return f"{prefix}-{digest}"
+
+
+def _normalize_program_level(raw_value: str) -> str:
+    value = str(raw_value or "").strip().lower()
+    if not value:
+        return "all"
+    if value in {"undergrad", "undergraduate", "ug"}:
+        return "undergrad"
+    if value in {"graduate", "grad", "ms", "phd", "master", "doctorate"}:
+        return "graduate"
+    if value in {"all", "common", "general"}:
+        return "all"
+    if any(token in value for token in ["?숈궗", "?숇?", "under"]):
+        return "undergrad"
+    if any(token in value for token in ["??숈썝", "?앹궗", "諛뺤궗", "grad"]):
+        return "graduate"
+    if any(token in value for token in ["?꾩껜", "怨듯넻", "怨듭?", "all"]):
+        return "all"
+    return "all"
+
+
+def _normalize_source_type(raw_value: str) -> str:
+    value = str(raw_value or "").strip().lower()
+    return re.sub(r"[^a-z0-9_/-]+", "", value)
+
+
+def _parse_target_json(line: str) -> Optional[Dict]:
+    raw = (line or "").strip()
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        repaired = raw
+        repaired = re.sub(r'"dept":"([^"]*),"detail":', r'"dept":"\1","detail":', repaired)
+        repaired = re.sub(r'"detail":"([^"]*),"url":', r'"detail":"\1","url":', repaired)
+        try:
+            return json.loads(repaired)
+        except json.JSONDecodeError:
+            return None
+
+
+def _default_school_name(school_id: str) -> str:
+    known = {
+        "knu": "Kyungpook National University",
+        "snu": "Seoul National University",
+    }
+    return known.get(school_id, school_id.upper())
+
+
+def _normalize_target(raw: Dict, fallback_school_id: str, fallback_school_name: str) -> Optional[Dict]:
+    url = str(raw.get("url", "")).strip()
+    if not url:
+        return None
+
+    school_id = _normalize_id(str(raw.get("school_id", fallback_school_id)), url, "school")
+    school_name = str(raw.get("school_name", fallback_school_name or _default_school_name(school_id)))
+    dept_name = str(raw.get("dept_name", raw.get("dept", "")) or "").strip()
+    dept_id = _normalize_id(
+        str(raw.get("dept_id", "")),
+        fallback_seed=f"{school_id}|{dept_name}|{url}",
+        prefix="dept",
+        fallback_label=dept_name,
+    )
+    program_level = _normalize_program_level(raw.get("program_level", raw.get("detail", "all")))
+    detail_label = str(raw.get("detail", program_level)).strip() or program_level
+    source_type = _normalize_source_type(raw.get("source_type", ""))
+
+    return {
+        "school_id": school_id,
+        "school_name": school_name,
+        "dept_id": dept_id,
+        "dept_name": dept_name or dept_id,
+        "dept": dept_name or dept_id,
+        "detail": detail_label,
+        "program_level": program_level,
+        "source_type": source_type,
+        "url": url,
+    }
+
+
+def _load_targets_from_file(path: Path, fallback_school_id: str, fallback_school_name: str) -> List[Dict]:
+    targets: List[Dict] = []
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            parsed = _parse_target_json(line)
+            if not parsed:
+                continue
+            normalized = _normalize_target(parsed, fallback_school_id, fallback_school_name)
+            if normalized:
+                targets.append(normalized)
+    return targets
+
+
 class BaseCrawler:
     def __init__(self, target):
-        self.dept = target["dept"]
-        self.detail = target["detail"]
+        self.dept = str(target.get("dept", target.get("dept_name", target.get("dept_id", "unknown"))))
+        self.detail = str(target.get("detail", target.get("program_level", "all")))
         self.base_url = target["url"]
+        self.school_id = _normalize_id(
+            str(target.get("school_id", "knu")),
+            fallback_seed=self.base_url,
+            prefix="school",
+        )
+        self.school_name = str(target.get("school_name", "Kyungpook National University"))
+        self.dept_id = _normalize_id(
+            str(target.get("dept_id", "")),
+            fallback_seed=f"{self.school_id}|{self.dept}|{self.base_url}",
+            prefix="dept",
+            fallback_label=self.dept,
+        )
+        self.dept_name = self.dept
+        self.program_level = _normalize_program_level(target.get("program_level", self.detail))
+        self.source_type = _normalize_source_type(target.get("source_type", ""))
 
-        safe_dept_name = sanitize_filename(self.dept)
-        self.file_path = os.path.join(CONFIG["data_dir"], f"{safe_dept_name}.jsonl")
+        school_dir = Path(CONFIG["data_dir"]) / self.school_id
+        school_dir.mkdir(parents=True, exist_ok=True)
+        self.file_path = school_dir / f"{self.dept_id}.jsonl"
         self.last_crawled_date = CONFIG["cutoff_date"]
 
         self.session = requests.Session()
         self.session.headers.update(CONFIG["headers"])
         self.collected_links = set()
-        if os.path.exists(self.file_path):
+        if self.file_path.exists():
             with file_lock:
                 try:
-                    with open(self.file_path, "r", encoding="utf-8") as f:
+                    with self.file_path.open("r", encoding="utf-8") as f:
                         for line in f:
                             try:
                                 data = json.loads(line)
@@ -84,7 +210,7 @@ class BaseCrawler:
             return
         with file_lock:
             try:
-                with open(self.file_path, "a", encoding="utf-8") as f:
+                with self.file_path.open("a", encoding="utf-8") as f:
                     f.write(json.dumps(post_data, ensure_ascii=False) + "\n")
                 self.collected_links.add(post_data["url"])
             except Exception as e:
@@ -188,8 +314,7 @@ class BaseCrawler:
             return False
 
         content, images_to_save, atts_to_save = parse_post_content(soup, link)
-        safe_dept = sanitize_filename(self.dept)
-        base_dir = Path(CONFIG["attachments_dir"]) / safe_dept / date
+        base_dir = Path(CONFIG["attachments_dir"]) / self.school_id / self.dept_id / date
         img_dir = base_dir / "images"
         att_dir = base_dir / "files"
 
@@ -231,8 +356,14 @@ class BaseCrawler:
 
         self.save_post(
             {
+                "school_id": self.school_id,
+                "school_name": self.school_name,
+                "dept_id": self.dept_id,
+                "dept_name": self.dept_name,
                 "dept": self.dept,
                 "detail": self.detail,
+                "program_level": self.program_level,
+                "source_type": self.source_type,
                 "title": title,
                 "date": date,
                 "url": link,
@@ -391,7 +522,7 @@ class TypeCCrawler(BaseCrawler):
                 is_notice = not cols[0].get_text(strip=True).isdigit()
                 if (not is_force_mode) and page_cnt > 1 and is_notice:
                     continue
-                if row.select("img[src*='secret'], img[alt*='鍮꾨?'], img[src*='lock']"):
+                if row.select("img[src*='secret'], img[alt*='??쑬?'], img[src*='lock']"):
                     continue
 
                 title_tag = None
@@ -439,6 +570,19 @@ class TypeCCrawler(BaseCrawler):
 
 
 def get_crawler(target):
+    source_type = _normalize_source_type(target.get("source_type", ""))
+    if source_type:
+        type_b_sources = {"gnuboard_php", "cms_board"}
+        type_c_sources = {"knu_home_sub"}
+        type_a_sources = {"other", "type_a"}
+
+        if source_type in type_c_sources:
+            return TypeCCrawler(target)
+        if source_type in type_b_sources:
+            return TypeBCrawler(target)
+        if source_type in type_a_sources:
+            return TypeACrawler(target)
+
     url = target["url"]
     if "home.knu.ac.kr" in url:
         return TypeCCrawler(target)
@@ -452,27 +596,33 @@ def process(target):
         crawler = get_crawler(target)
         crawler.crawl()
     except Exception as e:
-        print(f"[Fatal] {target.get('dept', 'unknown')} error: {e}")
+        name = target.get("dept_name") or target.get("dept") or target.get("dept_id") or "unknown"
+        print(f"[Fatal] {name} error: {e}")
 
 
 if __name__ == "__main__":
     targets = []
-    master_file = os.path.join("src", "crawl", "knu_master.jsonl")
+    schools_dir = Path("src") / "crawl" / "schools"
+    if schools_dir.exists():
+        for school_file in sorted(schools_dir.glob("*.jsonl")):
+            school_id = _normalize_id(school_file.stem, school_file.stem, "school")
+            school_name = _default_school_name(school_id)
+            loaded = _load_targets_from_file(school_file, school_id, school_name)
+            targets.extend(loaded)
+            print(f"Loaded {len(loaded)} targets from {school_file}")
 
-    if os.path.exists(master_file):
-        with open(master_file, "r", encoding="utf-8") as f:
-            for line in f:
-                try:
-                    data = json.loads(line)
-                    if "dept" in data and "url" in data:
-                        if "detail" not in data:
-                            data["detail"] = "怨듭?"
-                        targets.append(data)
-                except Exception:
-                    continue
-        print(f"Loaded {len(targets)} targets from {master_file}")
-    else:
-        print(f"[Error] {master_file} not found")
+    if not targets:
+        master_file = Path("src") / "crawl" / "knu_master.jsonl"
+        if master_file.exists():
+            loaded = _load_targets_from_file(
+                master_file,
+                fallback_school_id="knu",
+                fallback_school_name=_default_school_name("knu"),
+            )
+            targets.extend(loaded)
+            print(f"Loaded {len(loaded)} targets from {master_file} (fallback)")
+        else:
+            print(f"[Error] {master_file} not found")
 
     if targets:
         start_time = time.time()
@@ -480,3 +630,4 @@ if __name__ == "__main__":
             executor.map(process, targets)
         end_time = time.time()
         print(f"All tasks completed in {end_time - start_time:.2f}s")
+

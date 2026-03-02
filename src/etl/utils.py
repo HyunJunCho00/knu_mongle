@@ -108,7 +108,7 @@ def iter_metadata_files(input_dir: str) -> Iterator[Path]:
     root = Path(input_dir)
     if not root.exists():
         return iter(())
-    return (p for p in root.rglob("*_metadata.jsonl") if p.is_file())
+    return (p for p in root.rglob("*.jsonl") if p.is_file())
 
 
 def iter_jsonl(path: Path) -> Iterable[Dict]:
