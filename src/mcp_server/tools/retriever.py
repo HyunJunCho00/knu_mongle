@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 from qdrant_client import QdrantClient, models
+from src.core.config import settings
 
 
 class HybridRetriever:
@@ -24,7 +25,7 @@ class HybridRetriever:
             timeout=30,
             cloud_inference=True,
         )
-        self.collection_name = os.getenv("COLLECTION_NAME", "school_notice")
+        self.collection_name = os.getenv("COLLECTION_NAME", settings.COLLECTION_NAME)
 
         self.account_id = os.getenv("CF_ACCOUNT_ID") or os.getenv("CLOUDFLARE_ACCOUNT_ID")
         self.api_token = os.getenv("CF_API_TOKEN") or os.getenv("CLOUDFLARE_API_TOKEN")
