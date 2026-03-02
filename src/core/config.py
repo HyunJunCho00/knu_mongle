@@ -26,9 +26,9 @@ class Settings:
     CLOUDFLARE_API_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN")
     
     # Vector DB
-    QDRANT_URL = os.getenv("QDRANT_URL")
-    QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
-    COLLECTION_NAME = "knu_info"
+    QDRANT_URL = os.getenv("QDRANT_URL", "https://your-qdrant-endpoint")
+    QDRANT_API_KEY = os.getenv("QDRANT_API_KEY", "your-qdrant-api-key")
+    COLLECTION_NAME = os.getenv("COLLECTION_NAME", "school_info")
     
     # Email Configuration
     SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp.gmail.com")

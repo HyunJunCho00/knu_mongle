@@ -16,13 +16,13 @@ Recommended line schema:
 Run ingestion directly from crawled jsonl files:
 
 ```bash
-python -m src.etl.ingestion --input data --collection school_notice --batch-size 16
+python -m src.etl.ingestion --input data --collection school_info --batch-size 16
 ```
 
 Optional Groq metadata enrichment:
 
 ```bash
-python -m src.etl.ingestion --input data --collection school_notice --enable-groq-metadata
+python -m src.etl.ingestion --input data --collection school_info --enable-groq-metadata
 ```
 
 #### Required environment variables
