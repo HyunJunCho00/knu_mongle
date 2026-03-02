@@ -19,10 +19,16 @@ Run ingestion directly from crawled jsonl files:
 python -m src.etl.ingestion --input data --collection school_info --batch-size 16
 ```
 
-Optional Groq metadata enrichment:
+Optional metadata enrichment (GPU: local Qwen, non-GPU: Groq):
 
 ```bash
-python -m src.etl.ingestion --input data --collection school_info --enable-groq-metadata
+python -m src.etl.ingestion --input data --collection school_info --enable-metadata
+```
+
+Disable metadata enrichment:
+
+```bash
+python -m src.etl.ingestion --input data --collection school_info --disable-metadata
 ```
 
 #### Required environment variables

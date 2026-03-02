@@ -259,11 +259,86 @@ class LocalQwenMetadataEnricher:
             f"content: {content}"
         )
 
-    def enrich(self, title: str, content: str, date: str) -> Dict:
-        self._init_once()
-        if not self._ready:
-            return {}
+    @staticmethod
+    def _split_windows(text: str, window_size: int, overlap: int = 1200) -> List[str]:
+        if not text:
+            return [""]
+        if len(text) <= window_size:
+            return [text]
+        step = max(1, window_size - max(0, overlap))
+        windows = []
+        for start in range(0, len(text), step):
+            piece = text[start : start + window_size]
+            if not piece:
+                continue
+            windows.append(piece)
+            if start + window_size >= len(text):
+                break
+        return windows
 
+    @staticmethod
+    def _merge_metadata(base: Dict, new: Dict) -> Dict:
+        if not isinstance(base, dict):
+            base = {}
+        if not isinstance(new, dict) or not new:
+            return base
+
+        merged = dict(base)
+
+        for key in ["summary", "category", "target_group", "contact", "valid_until"]:
+            if not str(merged.get(key, "")).strip() and str(new.get(key, "")).strip():
+                merged[key] = new.get(key)
+
+        merged["requires_action"] = bool(merged.get("requires_action", False)) or bool(
+            new.get("requires_action", False)
+        )
+
+        try:
+            base_conf = float(merged.get("deadline_confidence", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            base_conf = 0.0
+        try:
+            new_conf = float(new.get("deadline_confidence", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            new_conf = 0.0
+        merged["deadline_confidence"] = max(base_conf, new_conf)
+
+        merged_deadlines = merged.get("deadlines", [])
+        if not isinstance(merged_deadlines, list):
+            merged_deadlines = []
+        new_deadlines = new.get("deadlines", [])
+        if not isinstance(new_deadlines, list):
+            new_deadlines = []
+        seen = set()
+        dedup = []
+        for item in merged_deadlines + new_deadlines:
+            if isinstance(item, dict):
+                label = str(item.get("label", "")).strip()
+                dt = str(item.get("datetime", "")).strip()
+                key = (label, dt)
+                if key in seen:
+                    continue
+                seen.add(key)
+                dedup.append({"label": label, "datetime": dt})
+            elif isinstance(item, str):
+                dt = item.strip()
+                key = ("", dt)
+                if key in seen:
+                    continue
+                seen.add(key)
+                dedup.append({"label": "", "datetime": dt})
+        merged["deadlines"] = dedup
+
+        merged_evidence = str(merged.get("evidence_text", "") or "").strip()
+        new_evidence = str(new.get("evidence_text", "") or "").strip()
+        if not merged_evidence and new_evidence:
+            merged["evidence_text"] = new_evidence
+        elif merged_evidence and new_evidence and new_evidence not in merged_evidence:
+            merged["evidence_text"] = f"{merged_evidence} | {new_evidence}"[:1000]
+
+        return merged
+
+    def _infer_once(self, title: str, content: str, date: str) -> Dict:
         content_text = content or ""
         input_sizes = [self.max_input_chars, min(8000, self.max_input_chars), min(5000, self.max_input_chars)]
 
@@ -295,8 +370,22 @@ class LocalQwenMetadataEnricher:
                     time.sleep(0.2)
                     continue
                 return {}
-
         return {}
+
+    def enrich(self, title: str, content: str, date: str) -> Dict:
+        self._init_once()
+        if not self._ready:
+            return {}
+
+        content_text = content or ""
+        windows = self._split_windows(content_text, window_size=self.max_input_chars, overlap=1200)
+        merged: Dict = {}
+
+        for window in windows:
+            parsed = self._infer_once(title=title, content=window, date=date)
+            merged = self._merge_metadata(merged, parsed)
+
+        return merged
 
 
 class GroqMetadataEnricher:
