@@ -545,7 +545,7 @@ class QdrantIngestor:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Metadata ingestion to Qdrant")
-    parser.add_argument("--input", default="metadata_v2_migrated", help="Input directory with *_metadata.jsonl files")
+    parser.add_argument("--input", default="data", help="Input directory with crawled .jsonl files")
     parser.add_argument("--collection", default="school_notice", help="Qdrant collection name")
     parser.add_argument("--batch-size", type=int, default=16, help="Upsert batch size")
     parser.add_argument(

@@ -30,3 +30,7 @@ output/
 # Notebooks
 *.ipynb
 
+# Markdown (track README only)
+*.md
+!README.md
+!readme.md
