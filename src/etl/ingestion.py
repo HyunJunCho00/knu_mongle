@@ -142,7 +142,7 @@ class QdrantIngestor:
         input_dir: str,
         collection_name: str,
         batch_size: int,
-        enable_groq_metadata: bool,
+        enable_metadata: bool,
     ):
         self.input_dir = input_dir
         self.collection_name = collection_name
@@ -158,7 +158,7 @@ class QdrantIngestor:
         print(f"[INFO] Dense encoder backend={self.dense_encoder.backend}")
 
         self.metadata_enricher: Optional[ConditionalMetadataEnricher] = None
-        if enable_groq_metadata:
+        if enable_metadata:
             self.metadata_enricher = ConditionalMetadataEnricher(groq_api_key=settings.GROQ_API_KEY)
             print(f"[INFO] Metadata enricher backend={self.metadata_enricher.backend}")
 
@@ -597,20 +597,46 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--batch-size", type=int, default=16, help="Upsert batch size")
     parser.add_argument(
-        "--enable-groq-metadata",
+        "--enable-metadata",
+        dest="enable_metadata",
         action="store_true",
-        help="Enable optional LLM metadata enrichment (GPU: local Qwen, non-GPU: Groq)",
+        default=None,
+        help="Enable LLM metadata enrichment (GPU: local Qwen, non-GPU: Groq)",
+    )
+    parser.add_argument(
+        "--disable-metadata",
+        dest="enable_metadata",
+        action="store_false",
+        help="Disable LLM metadata enrichment",
+    )
+    parser.add_argument(
+        "--enable-groq-metadata",
+        dest="enable_metadata",
+        action="store_true",
+        help=argparse.SUPPRESS,
     )
     return parser.parse_args()
 
 
+def _is_gpu_server() -> bool:
+    try:
+        import torch
+
+        return bool(torch.cuda.is_available())
+    except Exception:
+        return False
+
+
 def main() -> None:
     args = parse_args()
+    gpu_available = _is_gpu_server()
+    enable_metadata = args.enable_metadata if args.enable_metadata is not None else gpu_available
+    print(f"[INFO] Metadata enrichment enabled={enable_metadata} (gpu={gpu_available})")
     ingestor = QdrantIngestor(
         input_dir=args.input,
         collection_name=args.collection,
         batch_size=args.batch_size,
-        enable_groq_metadata=args.enable_groq_metadata,
+        enable_metadata=enable_metadata,
     )
     ingestor.run()
 
