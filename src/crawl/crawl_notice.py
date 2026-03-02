@@ -10,7 +10,7 @@ import hashlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, List, Optional
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import requests
 from bs4 import BeautifulSoup
@@ -79,6 +79,70 @@ def _normalize_program_level(raw_value: str) -> str:
 def _normalize_source_type(raw_value: str) -> str:
     value = str(raw_value or "").strip().lower()
     return re.sub(r"[^a-z0-9_/-]+", "", value)
+
+
+def _utc_now_iso() -> str:
+    return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+
+def _canonicalize_url(url: str) -> str:
+    raw = str(url or "").strip()
+    if not raw:
+        return ""
+    parts = urlsplit(raw)
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, parts.query, ""))
+
+
+def _normalize_date(value: str) -> str:
+    raw = str(value or "").strip().replace(".", "-").replace("/", "-")
+    m = re.search(r"(20\d{2})-(0[1-9]|1[0-2])-([0-2]\d|3[01])", raw)
+    if m:
+        return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+    return raw
+
+
+def _build_doc_id(school_id: str, dept_id: str, canonical_url: str) -> str:
+    seed = f"{school_id}|{dept_id}|{canonical_url}"
+    return hashlib.sha1(seed.encode("utf-8")).hexdigest()
+
+
+def _build_content_hash(
+    title: str,
+    published_at: str,
+    canonical_url: str,
+    content: str,
+    attachments: List[Dict],
+    images: List[Dict],
+) -> str:
+    compact_attachments = [
+        {
+            "name": a.get("name", ""),
+            "url": a.get("url", ""),
+            "sha256": a.get("sha256", ""),
+            "size": a.get("size", 0),
+            "status": a.get("status", ""),
+        }
+        for a in attachments
+    ]
+    compact_images = [
+        {
+            "url": i.get("url", ""),
+            "sha256": i.get("sha256", ""),
+            "size": i.get("size", 0),
+            "status": i.get("status", ""),
+        }
+        for i in images
+    ]
+    payload = {
+        "title": title,
+        "published_at": published_at,
+        "canonical_url": canonical_url,
+        "content": content,
+        "attachments": compact_attachments,
+        "images": compact_images,
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
 
 def _parse_target_json(line: str) -> Optional[Dict]:
@@ -178,6 +242,7 @@ class BaseCrawler:
         self.session = requests.Session()
         self.session.headers.update(CONFIG["headers"])
         self.collected_links = set()
+        self.doc_state: Dict[str, Dict[str, object]] = {}
         if self.file_path.exists():
             with file_lock:
                 try:
@@ -187,6 +252,23 @@ class BaseCrawler:
                                 data = json.loads(line)
                                 if "url" in data:
                                     self.collected_links.add(data["url"])
+                                canonical_url = _canonicalize_url(data.get("canonical_url") or data.get("url", ""))
+                                if not canonical_url:
+                                    continue
+                                doc_id = str(
+                                    data.get("doc_id")
+                                    or _build_doc_id(self.school_id, self.dept_id, canonical_url)
+                                )
+                                try:
+                                    version = int(data.get("version", 1) or 1)
+                                except Exception:
+                                    version = 1
+                                prev = self.doc_state.get(doc_id)
+                                if (not prev) or version >= int(prev.get("version", 0) or 0):
+                                    self.doc_state[doc_id] = {
+                                        "version": version,
+                                        "content_hash": str(data.get("content_hash", "")),
+                                    }
                             except Exception:
                                 continue
                 except Exception:
@@ -206,13 +288,34 @@ class BaseCrawler:
             return None
 
     def save_post(self, post_data):
-        if post_data["url"] in self.collected_links:
+        doc_id = str(post_data.get("doc_id", "")).strip()
+        if not doc_id:
+            canonical_url = _canonicalize_url(post_data.get("canonical_url") or post_data.get("url", ""))
+            doc_id = _build_doc_id(self.school_id, self.dept_id, canonical_url)
+            post_data["doc_id"] = doc_id
+
+        prev = self.doc_state.get(doc_id)
+        content_hash = str(post_data.get("content_hash", "")).strip()
+        if prev and content_hash and str(prev.get("content_hash", "")) == content_hash:
             return
+
+        version = 1
+        if prev:
+            try:
+                version = int(prev.get("version", 1) or 1) + 1
+            except Exception:
+                version = 2
+        post_data["version"] = version
+        post_data["is_current"] = True
+        post_data["updated_at"] = _utc_now_iso()
+        post_data.setdefault("collected_at", post_data["updated_at"])
+
         with file_lock:
             try:
                 with self.file_path.open("a", encoding="utf-8") as f:
                     f.write(json.dumps(post_data, ensure_ascii=False) + "\n")
                 self.collected_links.add(post_data["url"])
+                self.doc_state[doc_id] = {"version": version, "content_hash": content_hash}
             except Exception as e:
                 print(f"[Save Error] {self.dept}: {e}")
 
@@ -295,9 +398,6 @@ class BaseCrawler:
         return att_data, extracted_text
 
     def process_detail_page(self, title, date, link, referer=None, force_save=False):
-        if link in self.collected_links:
-            return True
-
         soup = self.fetch_page(link, referer)
         if not soup:
             return True
@@ -354,8 +454,23 @@ class BaseCrawler:
         if image_texts:
             content += "".join(image_texts)
 
+        canonical_url = _canonicalize_url(link)
+        published_at = _normalize_date(date)
+        content_hash = _build_content_hash(
+            title=title,
+            published_at=published_at,
+            canonical_url=canonical_url,
+            content=content,
+            attachments=processed_atts,
+            images=processed_images,
+        )
+        doc_id = _build_doc_id(self.school_id, self.dept_id, canonical_url)
+        timestamp = _utc_now_iso()
+
         self.save_post(
             {
+                "doc_id": doc_id,
+                "domain": "notice",
                 "school_id": self.school_id,
                 "school_name": self.school_name,
                 "dept_id": self.dept_id,
@@ -363,13 +478,33 @@ class BaseCrawler:
                 "dept": self.dept,
                 "detail": self.detail,
                 "program_level": self.program_level,
-                "source_type": self.source_type,
+                "source_type": self.source_type or "board_notice",
                 "title": title,
-                "date": date,
+                "date": published_at,
+                "published_at": published_at,
                 "url": link,
+                "canonical_url": canonical_url,
+                "collected_at": timestamp,
+                "content_hash": content_hash,
                 "content": content,
                 "images": processed_images,
                 "attachments": processed_atts,
+                "raw": {
+                    "title_raw": title,
+                    "date_raw": date,
+                    "url_raw": link,
+                    "content_raw": content,
+                },
+                "normalized": {
+                    "title": title.strip(),
+                    "published_at": published_at,
+                    "canonical_url": canonical_url,
+                    "content": content,
+                },
+                "assets": {
+                    "images": processed_images,
+                    "attachments": processed_atts,
+                },
             }
         )
         return True
