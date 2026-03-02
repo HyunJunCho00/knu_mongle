@@ -207,55 +207,73 @@ class QdrantIngestor:
                 return str(value).strip()
         return default
 
+    @staticmethod
+    def _safe_int(value: object, default: int = 0) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    def _resolve_content(self, row: Dict) -> str:
+        normalized = row.get("normalized", {})
+        if isinstance(normalized, dict):
+            content = normalize_whitespace(normalized.get("content", ""))
+            if content:
+                return content
+        return normalize_whitespace(row.get("content", ""))
+
+    def _resolve_title(self, row: Dict) -> str:
+        normalized = row.get("normalized", {})
+        if isinstance(normalized, dict):
+            title = normalize_whitespace(normalized.get("title", ""))
+            if title:
+                return title
+        return normalize_whitespace(row.get("title", ""))
+
+    def _resolve_date(self, row: Dict) -> str:
+        normalized = row.get("normalized", {})
+        if isinstance(normalized, dict):
+            published_at = str(normalized.get("published_at", "")).strip()
+            if published_at:
+                return published_at
+        return self._first_non_empty(row, ["published_at", "date"], "")
+
+    @staticmethod
+    def _resolve_attachments(row: Dict) -> List[Dict]:
+        attachments = row.get("attachments", [])
+        assets = row.get("assets", {})
+        if isinstance(assets, dict) and isinstance(assets.get("attachments"), list):
+            attachments = assets.get("attachments", [])
+        return attachments if isinstance(attachments, list) else []
+
     def _base_payload(self, row: Dict) -> Dict:
         school_id = self._first_non_empty(row, ["school_id", "school"], "")
-        school_name = self._first_non_empty(row, ["school_name"], "")
-        campus_id = self._first_non_empty(row, ["campus_id", "campus"], "")
-        campus_name = self._first_non_empty(row, ["campus_name"], "")
-        college_id = self._first_non_empty(row, ["college_id", "college"], "")
-        college_name = self._first_non_empty(row, ["college_name"], "")
         dept_id = self._first_non_empty(row, ["dept_id", "dept"], "")
-        dept_name = self._first_non_empty(row, ["dept_name"], "")
-        program_level = self._first_non_empty(row, ["program_level"], "all")
-
-        audience_tags_raw = row.get("audience_tags", [])
-        audience_tags = audience_tags_raw if isinstance(audience_tags_raw, list) else []
+        title = self._resolve_title(row)
+        date_value = self._resolve_date(row)
+        attachments = self._resolve_attachments(row)
 
         return {
+            "doc_id": self._first_non_empty(row, ["doc_id"], ""),
+            "domain": self._first_non_empty(row, ["domain"], "notice"),
+            "source_type": self._first_non_empty(row, ["source_type"], ""),
+            "version": self._safe_int(row.get("version", 1), default=1),
+            "is_current": bool(row.get("is_current", True)),
             "school_id": school_id,
-            "school_name": school_name,
-            "campus_id": campus_id,
-            "campus_name": campus_name,
-            "college_id": college_id,
-            "college_name": college_name,
             "dept_id": dept_id,
-            "dept_name": dept_name,
-            "program_level": program_level,
-            "audience_tags": audience_tags,
-            "url": row.get("url", ""),
-            "title": row.get("title", ""),
-            "date": str(row.get("date", "")),
-            "summary": row.get("summary", ""),
-            "deadlines": row.get("deadlines", []),
-            "requires_action": bool(row.get("requires_action", False)),
-            "contact": row.get("contact", ""),
-            "attachments": row.get("attachments", []),
-            "category": row.get("category", ""),
-            "target_group": row.get("target_group", ""),
-            "parser_name": row.get("parser_name", "none"),
-            "parser_version": row.get("parser_version", "unknown"),
-            "parse_confidence": float(row.get("parse_confidence", 0.0) or 0.0),
-            "parse_error": row.get("parse_error", ""),
-            "extraction_method": row.get("extraction_method", "text_parser"),
-            "pipeline_version": row.get("pipeline_version", "v2.0.0"),
-            "schema_version": row.get("schema_version", "structure-v1"),
-            "valid_until": row.get("valid_until", ""),
+            "program_level": self._first_non_empty(row, ["program_level"], "all"),
+            "url": self._first_non_empty(row, ["canonical_url", "url"], ""),
+            "title": title,
+            "date": date_value,
+            "valid_until": self._first_non_empty(row, ["valid_until"], ""),
             "is_expired": bool(row.get("is_expired", False)),
+            "requires_action": bool(row.get("requires_action", False)),
             "deadline_confidence": float(row.get("deadline_confidence", 0.0) or 0.0),
-            "evidence_text": row.get("evidence_text", ""),
-            # Backward compatibility
-            "school": school_id,
+            "has_attachments": bool(attachments),
+            "attachment_count": len(attachments),
+            # Backward compatibility key for retriever filter
             "dept": dept_id,
+            "school": school_id,
         }
 
     @staticmethod
@@ -372,7 +390,7 @@ class QdrantIngestor:
                     ]
                 ).strip()
             if not evidence_text:
-                evidence_text = self._deadline_evidence_from_content(str(row.get("content", "")))
+                evidence_text = self._deadline_evidence_from_content(self._resolve_content(row))
 
         return {
             "deadlines": normalized_deadlines if normalized_deadlines else deadlines_raw,
@@ -389,7 +407,7 @@ class QdrantIngestor:
 
         for idx, (row, chunk) in enumerate(rows):
             payload = self._base_payload(row)
-            doc_id = deterministic_uuid(
+            doc_id = payload.get("doc_id", "") or deterministic_uuid(
                 [payload["url"], payload["date"], payload["dept_id"], payload["title"]],
                 separator="|",
             )
@@ -416,8 +434,6 @@ class QdrantIngestor:
                     "parent_path": chunk.parent_path,
                     "section_header": chunk.section_header,
                     "chunk_index": chunk.chunk_index,
-                    "total_chunks": chunk.total_chunks,
-                    "parent_text": chunk.parent_text,
                 }
             )
 
@@ -480,6 +496,34 @@ class QdrantIngestor:
                 )
                 time.sleep(sleep_seconds)
 
+    def _row_doc_id(self, row: Dict) -> str:
+        existing = str(row.get("doc_id", "")).strip()
+        if existing:
+            return existing
+        return deterministic_uuid(
+            [
+                self._first_non_empty(row, ["canonical_url", "url"], ""),
+                self._resolve_date(row),
+                self._first_non_empty(row, ["dept_id", "dept"], ""),
+                self._resolve_title(row),
+            ],
+            separator="|",
+        )
+
+    def _iter_latest_rows(self, file_path) -> List[Dict]:
+        latest: Dict[str, Dict[str, object]] = {}
+        for order, row in enumerate(iter_jsonl(file_path)):
+            doc_id = self._row_doc_id(row)
+            version = self._safe_int(row.get("version", 1), default=1)
+            prev = latest.get(doc_id)
+            if (not prev) or version > int(prev["version"]) or (
+                version == int(prev["version"]) and order > int(prev["order"])
+            ):
+                latest[doc_id] = {"version": version, "order": order, "row": row}
+
+        selected = sorted(latest.values(), key=lambda item: int(item["order"]))
+        return [item["row"] for item in selected]
+
     def run(self) -> None:
         files = sorted(list(iter_metadata_files(self.input_dir)))
         if not files:
@@ -493,10 +537,10 @@ class QdrantIngestor:
             print(f"[INFO] Processing: {file_path}")
             batch_rows: List[Tuple[Dict, Chunk]] = []
 
-            for row in iter_jsonl(file_path):
-                title = normalize_whitespace(row.get("title", ""))
-                content = normalize_whitespace(row.get("content", "")) or title
-                date = str(row.get("date", ""))
+            for row in self._iter_latest_rows(file_path):
+                title = self._resolve_title(row)
+                content = self._resolve_content(row) or title
+                date = self._resolve_date(row)
                 row["content"] = content
 
                 if self.metadata_enricher and not row.get("summary"):
