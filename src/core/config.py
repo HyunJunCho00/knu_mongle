@@ -29,6 +29,11 @@ class Settings:
     QDRANT_URL = os.getenv("QDRANT_URL", "https://your-qdrant-endpoint")
     QDRANT_API_KEY = os.getenv("QDRANT_API_KEY", "your-qdrant-api-key")
     COLLECTION_NAME = os.getenv("COLLECTION_NAME", "school_info")
+    QDRANT_TIMEOUT_SECONDS = float(os.getenv("QDRANT_TIMEOUT_SECONDS", 90))
+    QDRANT_UPSERT_MAX_RETRIES = int(os.getenv("QDRANT_UPSERT_MAX_RETRIES", 6))
+    QDRANT_UPSERT_BASE_DELAY_SECONDS = float(
+        os.getenv("QDRANT_UPSERT_BASE_DELAY_SECONDS", 1.0)
+    )
     
     # Email Configuration
     SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp.gmail.com")

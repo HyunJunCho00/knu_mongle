@@ -1,5 +1,6 @@
-﻿import argparse
+import argparse
 import os
+import random
 import re
 import time
 from datetime import datetime
@@ -143,10 +144,15 @@ class QdrantIngestor:
         collection_name: str,
         batch_size: int,
         enable_metadata: bool,
+        qdrant_timeout: float,
+        upsert_max_retries: int,
     ):
         self.input_dir = input_dir
         self.collection_name = collection_name
         self.batch_size = batch_size
+        self.qdrant_timeout = qdrant_timeout
+        self.upsert_max_retries = upsert_max_retries
+        self.upsert_base_delay_seconds = max(settings.QDRANT_UPSERT_BASE_DELAY_SECONDS, 0.1)
         self.chunker = KoreanNoticeChunker(chunk_size=settings.CHUNK_SIZE)
 
         cf_account_id = os.getenv("CF_ACCOUNT_ID") or settings.CLOUDFLARE_ACCOUNT_ID
@@ -165,7 +171,7 @@ class QdrantIngestor:
         self.client = QdrantClient(
             url=settings.QDRANT_URL,
             api_key=settings.QDRANT_API_KEY,
-            timeout=30,
+            timeout=self.qdrant_timeout,
             cloud_inference=True,
         )
         self._ensure_collection()
@@ -459,16 +465,25 @@ class QdrantIngestor:
         return points
 
     @staticmethod
-    def _status_code_from_error(exc: Exception) -> Optional[int]:
-        status_code = getattr(exc, "status_code", None)
-        if isinstance(status_code, int):
-            return status_code
+    def _iter_error_chain(exc: Exception):
+        seen = set()
+        current = exc
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            yield current
+            current = getattr(current, "__cause__", None) or getattr(current, "__context__", None)
 
-        response = getattr(exc, "response", None)
-        if response is not None:
-            response_code = getattr(response, "status_code", None)
-            if isinstance(response_code, int):
-                return response_code
+    def _status_code_from_error(self, exc: Exception) -> Optional[int]:
+        for err in self._iter_error_chain(exc):
+            status_code = getattr(err, "status_code", None)
+            if isinstance(status_code, int):
+                return status_code
+
+            response = getattr(err, "response", None)
+            if response is not None:
+                response_code = getattr(response, "status_code", None)
+                if isinstance(response_code, int):
+                    return response_code
 
         message = str(exc)
         if "429" in message:
@@ -478,21 +493,39 @@ class QdrantIngestor:
                 return code
         return None
 
-    def _upsert_with_retry(self, points: List[models.PointStruct], max_retries: int = 4) -> None:
+    def _is_retryable_error(self, exc: Exception) -> bool:
+        status_code = self._status_code_from_error(exc)
+        if status_code == 429 or (status_code is not None and 500 <= status_code < 600):
+            return True
+
+        timeout_markers = ("timeout", "timed out", "temporarily unavailable", "connection reset")
+        for err in self._iter_error_chain(exc):
+            name = err.__class__.__name__.lower()
+            msg = str(err).lower()
+            if isinstance(err, (ConnectionError, TimeoutError, OSError)):
+                return True
+            if any(marker in name or marker in msg for marker in timeout_markers):
+                return True
+        return False
+
+    def _upsert_with_retry(self, points: List[models.PointStruct]) -> None:
+        max_retries = self.upsert_max_retries
         for attempt in range(max_retries + 1):
             try:
                 self.client.upsert(collection_name=self.collection_name, points=points, wait=False)
                 return
             except Exception as exc:
                 status_code = self._status_code_from_error(exc)
-                is_retryable = status_code == 429 or (status_code is not None and 500 <= status_code < 600)
+                is_retryable = self._is_retryable_error(exc)
                 if not is_retryable or attempt == max_retries:
                     raise
 
-                sleep_seconds = min(2 ** attempt, 8)
+                sleep_seconds = min((2 ** attempt) * self.upsert_base_delay_seconds, 12.0)
+                sleep_seconds += random.uniform(0.0, 0.25)
                 print(
                     f"[WARN] Upsert retry attempt={attempt + 1}/{max_retries} "
-                    f"status={status_code} sleep={sleep_seconds}s"
+                    f"status={status_code} sleep={sleep_seconds:.2f}s "
+                    f"error={exc.__class__.__name__}"
                 )
                 time.sleep(sleep_seconds)
 
@@ -597,6 +630,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--batch-size", type=int, default=16, help="Upsert batch size")
     parser.add_argument(
+        "--qdrant-timeout",
+        type=float,
+        default=settings.QDRANT_TIMEOUT_SECONDS,
+        help="Qdrant HTTP timeout in seconds",
+    )
+    parser.add_argument(
+        "--upsert-max-retries",
+        type=int,
+        default=settings.QDRANT_UPSERT_MAX_RETRIES,
+        help="Maximum retry count for upsert on retryable errors",
+    )
+    parser.add_argument(
         "--enable-metadata",
         dest="enable_metadata",
         action="store_true",
@@ -637,11 +682,11 @@ def main() -> None:
         collection_name=args.collection,
         batch_size=args.batch_size,
         enable_metadata=enable_metadata,
+        qdrant_timeout=args.qdrant_timeout,
+        upsert_max_retries=max(0, args.upsert_max_retries),
     )
     ingestor.run()
 
 
 if __name__ == "__main__":
     main()
-
-
