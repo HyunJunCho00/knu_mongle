@@ -1,8 +1,11 @@
 import argparse
+import hashlib
+import json
 import os
 import random
 import re
 import time
+from pathlib import Path
 from datetime import datetime
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
@@ -49,7 +52,7 @@ class KoreanNoticeChunker:
         current_header = "본문"
         current_lines: List[str] = []
         header_pattern = re.compile(
-            r"^\s*(\d+[.)]|[가-힣A-Za-z]{1,20}\s*[:：]|[■◆▶●]+|[0-9]+\s*-\s*)"
+            r"^\s*(?:\d+[.)]|[가-힣A-Za-z]{1,20}\s*[:.)]|[■●◆▶▷※]+|[0-9]+\s*-\s*)"
         )
 
         for line in lines:
@@ -146,14 +149,20 @@ class QdrantIngestor:
         enable_metadata: bool,
         qdrant_timeout: float,
         upsert_max_retries: int,
+        skip_unchanged: bool,
     ):
         self.input_dir = input_dir
         self.collection_name = collection_name
         self.batch_size = batch_size
         self.qdrant_timeout = qdrant_timeout
         self.upsert_max_retries = upsert_max_retries
+        self.skip_unchanged = bool(skip_unchanged)
         self.upsert_base_delay_seconds = max(settings.QDRANT_UPSERT_BASE_DELAY_SECONDS, 0.1)
         self.chunker = KoreanNoticeChunker(chunk_size=settings.CHUNK_SIZE)
+        self._doc_fingerprint_cache_path = self._build_cache_path()
+        self._doc_fingerprints: Dict[str, str] = (
+            self._load_doc_fingerprints() if self.skip_unchanged else {}
+        )
 
         cf_account_id = os.getenv("CF_ACCOUNT_ID") or settings.CLOUDFLARE_ACCOUNT_ID
         cf_api_token = os.getenv("CF_API_TOKEN") or settings.CLOUDFLARE_API_TOKEN
@@ -175,6 +184,50 @@ class QdrantIngestor:
             cloud_inference=True,
         )
         self._ensure_collection()
+
+    def _build_cache_path(self) -> Path:
+        cache_root = Path(".ingestion_cache")
+        cache_root.mkdir(parents=True, exist_ok=True)
+        safe_collection = re.sub(r"[^A-Za-z0-9._-]", "_", self.collection_name)
+        input_hash = hashlib.sha1(
+            str(Path(self.input_dir).resolve()).encode("utf-8")
+        ).hexdigest()[:10]
+        return cache_root / f"{safe_collection}_{input_hash}.json"
+
+    def _load_doc_fingerprints(self) -> Dict[str, str]:
+        path = self._doc_fingerprint_cache_path
+        if not path.exists():
+            return {}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            print(f"[WARN] Fingerprint cache load failed: {path}")
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        out: Dict[str, str] = {}
+        for key, value in data.items():
+            doc_id = str(key).strip()
+            fp = str(value).strip()
+            if doc_id and fp:
+                out[doc_id] = fp
+        print(f"[INFO] Loaded fingerprint cache docs={len(out)} from {path}")
+        return out
+
+    def _save_doc_fingerprints(self) -> None:
+        if not self.skip_unchanged:
+            return
+        path = self._doc_fingerprint_cache_path
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        try:
+            tmp.write_text(
+                json.dumps(self._doc_fingerprints, ensure_ascii=False, sort_keys=True),
+                encoding="utf-8",
+            )
+            tmp.replace(path)
+            print(f"[INFO] Saved fingerprint cache docs={len(self._doc_fingerprints)} to {path}")
+        except OSError as exc:
+            print(f"[WARN] Fingerprint cache save failed: {exc}")
 
     def _ensure_collection(self) -> None:
         quantization = models.ScalarQuantization(
@@ -303,12 +356,20 @@ class QdrantIngestor:
         )
         if match:
             y, m, d, hh, mm = match.groups()
-            return f"{y}-{m}-{d}T{hh}:{mm}"
+            try:
+                dt = datetime(int(y), int(m), int(d), int(hh), int(mm))
+                return dt.strftime("%Y-%m-%dT%H:%M")
+            except ValueError:
+                pass
 
         date_only = re.search(r"(20\d{2})-(0[1-9]|1[0-2])-([0-2]\d|3[01])", value)
         if date_only:
             y, m, d = date_only.groups()
-            return f"{y}-{m}-{d}T23:59"
+            try:
+                dt = datetime(int(y), int(m), int(d), 23, 59)
+                return dt.strftime("%Y-%m-%dT%H:%M")
+            except ValueError:
+                pass
         return None
 
     @staticmethod
@@ -316,7 +377,11 @@ class QdrantIngestor:
         text = str(content or "")
         if not text:
             return ""
-        keyword_match = re.search(r"(마감|기한|제출|접수|deadline|due)", text, flags=re.IGNORECASE)
+        keyword_match = re.search(
+            r"(마감|기한|제출|접수|deadline|due)",
+            text,
+            flags=re.IGNORECASE,
+        )
         date_match = re.search(
             r"(20\d{2}[./-](0[1-9]|1[0-2])[./-]([0-2]\d|3[01])(?:\s*[T ]\s*[0-2]\d:[0-5]\d)?)",
             text,
@@ -543,6 +608,37 @@ class QdrantIngestor:
             separator="|",
         )
 
+    def _row_fingerprint(self, row: Dict) -> str:
+        raw_confidence = row.get("deadline_confidence", 0.0)
+        try:
+            confidence = float(raw_confidence or 0.0)
+        except (TypeError, ValueError):
+            confidence = 0.0
+        canonical = {
+            "doc_id": self._row_doc_id(row),
+            "url": self._first_non_empty(row, ["canonical_url", "url"], ""),
+            "title": self._resolve_title(row),
+            "date": self._resolve_date(row),
+            "content": self._resolve_content(row),
+            "valid_until": str(row.get("valid_until", "") or "").strip(),
+            "requires_action": bool(row.get("requires_action", False)),
+            "deadline_confidence": confidence,
+            "deadlines": row.get("deadlines", []),
+            "attachments": self._resolve_attachments(row),
+            "chunk_size": self.chunker.chunk_size,
+        }
+        raw = json.dumps(canonical, ensure_ascii=False, sort_keys=True, default=str)
+        return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+    def _update_fingerprint_cache_from_batch(self, rows: List[Tuple[Dict, Chunk]]) -> None:
+        if not self.skip_unchanged:
+            return
+        for row, _ in rows:
+            doc_id = str(row.get("doc_id", "")).strip()
+            fp = str(row.get("_fingerprint", "")).strip()
+            if doc_id and fp:
+                self._doc_fingerprints[doc_id] = fp
+
     def _iter_latest_rows(self, file_path) -> List[Dict]:
         latest: Dict[str, Dict[str, object]] = {}
         for order, row in enumerate(iter_jsonl(file_path)):
@@ -564,60 +660,82 @@ class QdrantIngestor:
             return
 
         total_docs = 0
+        upsert_docs = 0
+        skipped_docs = 0
         total_chunks = 0
 
-        for file_path in files:
-            print(f"[INFO] Processing: {file_path}")
-            batch_rows: List[Tuple[Dict, Chunk]] = []
+        try:
+            for file_path in files:
+                print(f"[INFO] Processing: {file_path}")
+                batch_rows: List[Tuple[Dict, Chunk]] = []
 
-            for row in self._iter_latest_rows(file_path):
-                title = self._resolve_title(row)
-                content = self._resolve_content(row) or title
-                date = self._resolve_date(row)
-                row["content"] = content
+                for row in self._iter_latest_rows(file_path):
+                    total_docs += 1
+                    title = self._resolve_title(row)
+                    content = self._resolve_content(row) or title
+                    date = self._resolve_date(row)
+                    row["content"] = content
+                    doc_id = self._row_doc_id(row)
+                    row["doc_id"] = doc_id
+                    row["_fingerprint"] = self._row_fingerprint(row)
 
-                if self.metadata_enricher and not row.get("summary"):
-                    enriched = self.metadata_enricher.enrich(title=title, content=content, date=date)
-                    if enriched:
-                        row["summary"] = row.get("summary") or enriched.get("summary", "")
-                        row["deadlines"] = row.get("deadlines") or enriched.get("deadlines", [])
-                        row["requires_action"] = row.get(
-                            "requires_action", enriched.get("requires_action", False)
-                        )
-                        row["contact"] = row.get("contact") or enriched.get("contact", "")
-                        row["category"] = row.get("category") or enriched.get("category", "")
-                        row["target_group"] = row.get("target_group") or enriched.get("target_group", "")
-                        row["valid_until"] = row.get("valid_until") or enriched.get("valid_until", "")
-                        row["deadline_confidence"] = (
-                            row.get("deadline_confidence")
-                            if row.get("deadline_confidence") not in (None, "")
-                            else enriched.get("deadline_confidence", 0.0)
-                        )
-                        row["evidence_text"] = row.get("evidence_text") or enriched.get("evidence_text", "")
+                    if self.skip_unchanged and self._doc_fingerprints.get(doc_id) == row["_fingerprint"]:
+                        skipped_docs += 1
+                        continue
 
-                row.update(self._derive_deadline_fields(row))
+                    if self.metadata_enricher and not row.get("summary"):
+                        enriched = self.metadata_enricher.enrich(title=title, content=content, date=date)
+                        if enriched:
+                            row["summary"] = row.get("summary") or enriched.get("summary", "")
+                            row["deadlines"] = row.get("deadlines") or enriched.get("deadlines", [])
+                            row["requires_action"] = row.get(
+                                "requires_action", enriched.get("requires_action", False)
+                            )
+                            row["contact"] = row.get("contact") or enriched.get("contact", "")
+                            row["category"] = row.get("category") or enriched.get("category", "")
+                            row["target_group"] = row.get("target_group") or enriched.get("target_group", "")
+                            row["valid_until"] = row.get("valid_until") or enriched.get("valid_until", "")
+                            row["deadline_confidence"] = (
+                                row.get("deadline_confidence")
+                                if row.get("deadline_confidence") not in (None, "")
+                                else enriched.get("deadline_confidence", 0.0)
+                            )
+                            row["evidence_text"] = (
+                                row.get("evidence_text") or enriched.get("evidence_text", "")
+                            )
 
-                chunks = self.chunker.chunk(content, title=title)
-                if not chunks:
-                    continue
+                    row.update(self._derive_deadline_fields(row))
 
-                total_docs += 1
-                for chunk in chunks:
-                    batch_rows.append((row, chunk))
-                    if len(batch_rows) >= self.batch_size:
-                        points = self._build_points(batch_rows)
-                        self._upsert_with_retry(points)
-                        total_chunks += len(points)
-                        print(f"[INFO] Upserted batch chunks: {len(points)} (total={total_chunks})")
-                        batch_rows = []
+                    chunks = self.chunker.chunk(content, title=title)
+                    if not chunks:
+                        if self.skip_unchanged:
+                            self._doc_fingerprints[doc_id] = str(row["_fingerprint"])
+                        continue
 
-            if batch_rows:
-                points = self._build_points(batch_rows)
-                self._upsert_with_retry(points)
-                total_chunks += len(points)
-                print(f"[INFO] Upserted final file batch: {len(points)} (total={total_chunks})")
+                    upsert_docs += 1
+                    for chunk in chunks:
+                        batch_rows.append((row, chunk))
+                        if len(batch_rows) >= self.batch_size:
+                            points = self._build_points(batch_rows)
+                            self._upsert_with_retry(points)
+                            self._update_fingerprint_cache_from_batch(batch_rows)
+                            total_chunks += len(points)
+                            print(f"[INFO] Upserted batch chunks: {len(points)} (total={total_chunks})")
+                            batch_rows = []
 
-        print(f"[DONE] docs={total_docs}, chunks={total_chunks}, collection={self.collection_name}")
+                if batch_rows:
+                    points = self._build_points(batch_rows)
+                    self._upsert_with_retry(points)
+                    self._update_fingerprint_cache_from_batch(batch_rows)
+                    total_chunks += len(points)
+                    print(f"[INFO] Upserted final file batch: {len(points)} (total={total_chunks})")
+        finally:
+            self._save_doc_fingerprints()
+
+        print(
+            f"[DONE] docs={total_docs}, upsert_docs={upsert_docs}, "
+            f"skipped_docs={skipped_docs}, chunks={total_chunks}, collection={self.collection_name}"
+        )
 
 
 def parse_args() -> argparse.Namespace:
@@ -640,6 +758,19 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=settings.QDRANT_UPSERT_MAX_RETRIES,
         help="Maximum retry count for upsert on retryable errors",
+    )
+    parser.add_argument(
+        "--skip-unchanged",
+        dest="skip_unchanged",
+        action="store_true",
+        default=True,
+        help="Skip docs with unchanged fingerprint from previous ingestion run",
+    )
+    parser.add_argument(
+        "--no-skip-unchanged",
+        dest="skip_unchanged",
+        action="store_false",
+        help="Always rebuild and upsert all docs (disable fingerprint skip cache)",
     )
     parser.add_argument(
         "--enable-metadata",
@@ -684,6 +815,7 @@ def main() -> None:
         enable_metadata=enable_metadata,
         qdrant_timeout=args.qdrant_timeout,
         upsert_max_retries=max(0, args.upsert_max_retries),
+        skip_unchanged=args.skip_unchanged,
     )
     ingestor.run()
 
